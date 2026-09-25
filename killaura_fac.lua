@@ -1,5 +1,5 @@
 --[[
-	杀戮光环 v1.6 · 在设施翻新中生存（placeId 107946054053457）· Obsidian 全中文
+	杀戮光环 v1.7 · 在设施翻新中生存（placeId 107946054053457）· Obsidian 全中文
 	协议（反编译+实测实锤）：
 	  Knife.HitEvent:FireServer(怪Model, 怪Humanoid)   —— 一刀 50 伤害
 	  Knife.PlaySound:FireServer("Play", Handle.Swing) —— 挥击音效（伴随发送）
@@ -20,7 +20,7 @@ local lp = Players.LocalPlayer
 local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/deividcomsono/Obsidian/refs/heads/main/Library.lua"))()
 local Window = Library:CreateWindow({
 	Title = "杀戮光环",
-	Footer = "v1.6 · 设施生存",
+	Footer = "v1.7 · 设施生存",
 	ToggleKeybind = Enum.KeyCode.RightControl,
 	Center = true,
 	AutoShow = true,
@@ -62,11 +62,21 @@ grpMain:AddToggle("Enabled", {
 		end
 	end,
 })
+grpMain:AddToggle("TP_Enabled", {
+	Text = "瞬移光环（传送到怪旁打，打完回原位）",
+	Default = true,
+	Callback = function(v) State.TP_Enabled = v end,
+})
+grpMain:AddToggle("Walk_Enabled", {
+	Text = "走动光环（不瞬移，自由走动清身边怪）",
+	Default = true,
+	Callback = function(v) State.Walk_Enabled = v end,
+})
 grpMain:AddLabel("快捷键：右Ctrl 显隐界面")
 
 local grpParam = TabMain:AddRightGroupbox("参数")
 grpParam:AddSlider("TPRadius", {
-	Text = "瞬移光环范围（瞬移到怪旁打，打完回原位）", Default = 40, Min = 5, Max = 100, Rounding = 0, Suffix = "格",
+	Text = "瞬移光环范围（最高 1000，越大清图越广、每轮越慢）", Default = 100, Min = 5, Max = 1000, Rounding = 0, Suffix = "格",
 	Callback = function(v) State.TP_Radius = v end,
 })
 grpParam:AddSlider("WalkRadius", {
@@ -291,5 +301,5 @@ task.spawn(function()
 	end
 end)
 
-Library:Notify("杀戮光环 v1.6 已加载", 4)
-print("[杀戮光环] v1.6 加载完成")
+Library:Notify("杀戮光环 v1.7 已加载", 4)
+print("[杀戮光环] v1.7 加载完成")
