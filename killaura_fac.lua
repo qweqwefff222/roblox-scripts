@@ -36,6 +36,7 @@ local State = {
 	Stat = { Hits = 0, Kills = 0, Targets = 0, Dna = 0 },
 }
 local AnchorPos = nil    -- 定身锚点
+local StandPos = nil     -- 站桩点（定身关闭时钉位用：开启光环时自动记录当前位置）
 local Blacklist = {}     -- 击杀/失效目标短名单（防重复选死目标）
 
 -- 帧等待延迟（不忙等占核；hook 全局 wait 会导致游戏 Lua 调度器卡死——已移除该功能，
@@ -55,6 +56,9 @@ grpMain:AddToggle("Enabled", {
 	Default = false,
 	Callback = function(v)
 		State.Enabled = v
+		if v and not State.AnchorChar then
+			StandPos = nil -- 站桩模式每次开启都在当前位置重新站桩
+		end
 		if v then
 			local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
 			AnchorPos = hrp and hrp.Position or nil
@@ -85,9 +89,14 @@ grpParam:AddSlider("Interval", {
 	Callback = function(v) State.Interval = v end,
 })
 grpParam:AddToggle("AnchorChar", {
-	Text = "定身挂机（原地清怪）",
+	Text = "定身挂机（开=瞬移清怪钉回锚点 / 关=站桩不瞬移，原地清怪14格内）",
 	Default = true,
-	Callback = function(v) State.AnchorChar = v end,
+	Callback = function(v)
+		State.AnchorChar = v
+		if not v then
+			StandPos = nil -- 切到站桩模式：下次循环在当前位置重新站桩
+		end
+	end,
 })
 grpParam:AddLabel("无冷却：直发协议已绕过本地冷却，无需 hook")
 grpParam:AddLabel("（hook 全局 wait 会卡死游戏，已移除该选项）")
@@ -213,17 +222,30 @@ task.spawn(function()
 			local char = lp.Character
 			hrp = char and char:FindFirstChild("HumanoidRootPart")
 			if hrp and hrp.Parent then
-				-- 定身：钉回锚点（HRP 保持非锚定以维持网络所有权，Handle 复制才有效）
+				-- 位置钉定（HRP 保持非锚定以维持网络所有权，Handle/协议复制才有效）
 				if State.AnchorChar and AnchorPos then
+					-- 定身模式：钉回用户锚点
 					hrp.Anchored = false
 					hrp.CFrame = CFrame.new(AnchorPos)
+					hrp.AssemblyLinearVelocity = Vector3.zero
+				elseif not State.AnchorChar then
+					-- 站桩模式：钉回开启点（防怪推搡位移），角色零移动原地清怪
+					if StandPos == nil then
+						StandPos = hrp.Position
+						log("站桩点已记录")
+					end
+					hrp.Anchored = false
+					hrp.CFrame = CFrame.new(StandPos)
 					hrp.AssemblyLinearVelocity = Vector3.zero
 				end
 				local hitEvent, playSound, swing = getKnife()
 				if hitEvent then
 					-- 收集范围内活怪（带 Enemy 标记，通用适配）
 					local targets = {}
-					local r2 = State.Radius * State.Radius
+					-- 站桩模式（定身关）：角色不动，服务器命中距离上限 ~16 studs（实测 16 命中 18 失效）
+					-- 有效攻击半径取 14 留余量；范围外的怪会自己走近进入范围
+					local effRadius = State.AnchorChar and State.Radius or math.min(State.Radius, 14)
+					local r2 = effRadius * effRadius
 					local base = State.AnchorChar and AnchorPos or (hrp.Position)
 					for _, d in ipairs(workspace:GetDescendants()) do
 						if d:IsA("Model") and d:FindFirstChild("Enemy") and not Blacklist[d] then
@@ -240,17 +262,17 @@ task.spawn(function()
 						end
 					end
 					State.Stat.Targets = #targets
-					-- 逐个攻击（瞬移到旁 + 面朝 + swing + fire）
+					-- 逐个攻击
 					for _, t in ipairs(targets) do
 						if not State.Enabled then break end
 						if t.hum.Parent and t.hum.Health > 0 then
 							local pre = t.hum.Health
-							-- 瞬移到怪旁 3.5 studs 面朝怪（服务器距离校验范围内）
-							hrp.CFrame = CFrame.lookAt(t.root.Position + t.root.CFrame.LookVector * 3.5, t.root.Position)
-							if State.AnchorChar and AnchorPos then
-								-- 定身模式下保持锚点不变（下一轮钉回）
+							if State.AnchorChar then
+								-- 定身模式：瞬移到怪旁 3.5 studs 面朝怪（服务器距离校验范围内）
+								hrp.CFrame = CFrame.lookAt(t.root.Position + t.root.CFrame.LookVector * 3.5, t.root.Position)
+								delay(0.08) -- 就位
 							end
-							delay(0.08) -- 就位
+							-- 站桩模式：角色零移动，原地直发协议（目标已按 14 studs 过滤）
 							playSound:FireServer("Play", swing)
 							hitEvent:FireServer(t.model, t.hum)
 							State.Stat.Hits += 1
