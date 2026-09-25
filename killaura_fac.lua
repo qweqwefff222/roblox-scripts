@@ -1,5 +1,5 @@
 --[[
-	杀戮光环 v1.4 · 在设施翻新中生存（placeId 107946054053457）· Obsidian 全中文
+	杀戮光环 v1.6 · 在设施翻新中生存（placeId 107946054053457）· Obsidian 全中文
 	协议（反编译+实测实锤）：
 	  Knife.HitEvent:FireServer(怪Model, 怪Humanoid)   —— 一刀 50 伤害
 	  Knife.PlaySound:FireServer("Play", Handle.Swing) —— 挥击音效（伴随发送）
@@ -20,7 +20,7 @@ local lp = Players.LocalPlayer
 local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/deividcomsono/Obsidian/refs/heads/main/Library.lua"))()
 local Window = Library:CreateWindow({
 	Title = "杀戮光环",
-	Footer = "v1.4 · 设施生存",
+	Footer = "v1.6 · 设施生存",
 	ToggleKeybind = Enum.KeyCode.RightControl,
 	Center = true,
 	AutoShow = true,
@@ -30,13 +30,13 @@ local TabStat = Window:AddTab("状态", "activity")
 
 local State = {
 	Enabled = false,        -- 总开关
-	Radius = 30,            -- 光环范围（studs）
-	Interval = 0.25,        -- 挥击节奏（秒）：服务器统计挥击频率踢人（"Swinging too fast"），≥0.22 模拟正常连点；每轮一次挥击全目标结算
-	AnchorChar = true,      -- 定身（瞬移清怪不被围攻拖走）
+	TP_Enabled = true,      -- 瞬移光环：瞬移到怪旁打（大范围扫图），打完回原位
+	TP_Radius = 40,         -- 瞬移光环范围（studs）
+	Walk_Enabled = true,    -- 走动光环：不瞬移，角色完全由你控制，只清身边怪
+	Walk_Radius = 12,       -- 走动光环范围（上限 14 = 服务器命中距离校验实测值）
+	Interval = 0.25,        -- 共享挥击节奏（秒）：两光环共用 1 次 PlaySound/轮，服务器统计挥击频率踢人，≥0.22 模拟正常连点
 	Stat = { Hits = 0, Kills = 0, Targets = 0, Dna = 0 },
 }
-local AnchorPos = nil    -- 定身锚点
-local StandPos = nil     -- 站桩点（定身关闭时钉位用：开启光环时自动记录当前位置）
 local Blacklist = {}     -- 击杀/失效目标短名单（防重复选死目标）
 
 -- 帧等待延迟（不忙等占核；hook 全局 wait 会导致游戏 Lua 调度器卡死——已移除该功能，
@@ -56,47 +56,26 @@ grpMain:AddToggle("Enabled", {
 	Default = false,
 	Callback = function(v)
 		State.Enabled = v
-		if v and not State.AnchorChar then
-			StandPos = nil -- 站桩模式每次开启都在当前位置重新站桩
-		end
-		if v then
-			local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
-			AnchorPos = hrp and hrp.Position or nil
-		else
-			AnchorPos = nil
+		if not v then
 			local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
 			if hrp then hrp.Anchored = false end
 		end
 	end,
 })
-grpMain:AddButton({
-	Text = "以当前位置重新定身",
-	Func = function()
-		local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
-		AnchorPos = hrp and hrp.Position or nil
-		log("定身锚点已更新")
-	end,
-})
 grpMain:AddLabel("快捷键：右Ctrl 显隐界面")
 
 local grpParam = TabMain:AddRightGroupbox("参数")
-grpParam:AddSlider("Radius", {
-	Text = "光环范围", Default = 30, Min = 10, Max = 80, Rounding = 0, Suffix = "格",
-	Callback = function(v) State.Radius = v end,
+grpParam:AddSlider("TPRadius", {
+	Text = "瞬移光环范围（瞬移到怪旁打，打完回原位）", Default = 40, Min = 5, Max = 100, Rounding = 0, Suffix = "格",
+	Callback = function(v) State.TP_Radius = v end,
+})
+grpParam:AddSlider("WalkRadius", {
+	Text = "走动光环范围（不瞬移，上限14=服务器命中校验）", Default = 12, Min = 3, Max = 14, Rounding = 0, Suffix = "格",
+	Callback = function(v) State.Walk_Radius = v end,
 })
 grpParam:AddSlider("Interval", {
 	Text = "挥击节奏（≥0.22 安全，0.1 持续会被踢）", Default = 0.25, Min = 0.2, Max = 2, Rounding = 2, Suffix = "秒",
 	Callback = function(v) State.Interval = v end,
-})
-grpParam:AddToggle("AnchorChar", {
-	Text = "定身挂机（开=瞬移清怪钉回锚点 / 关=站桩不瞬移，原地清怪14格内）",
-	Default = true,
-	Callback = function(v)
-		State.AnchorChar = v
-		if not v then
-			StandPos = nil -- 切到站桩模式：下次循环在当前位置重新站桩
-		end
-	end,
 })
 grpParam:AddLabel("无冷却：直发协议已绕过本地冷却，无需 hook")
 grpParam:AddLabel("（hook 全局 wait 会卡死游戏，已移除该选项）")
@@ -135,27 +114,37 @@ task.spawn(function()
 end)
 
 -- ================= 武器 =================
-local function getKnife()
+-- 通用近战武器探测：任何带 HitEvent 的 Tool（刀/斧/棒等，协议同源）
+-- 优先用手上已装备的；手上没有近战则从背包自动装备一把（下一轮生效）
+local function getMelee()
 	local char = lp.Character
 	if not char then return nil end
-	local knife = char:FindFirstChild("Knife")
-	if not knife then
-		local bp = lp:FindFirstChild("Backpack")
-		knife = bp and bp:FindFirstChild("Knife")
-		if not knife then return nil end
-		local hum = char:FindFirstChildOfClass("Humanoid")
-		if not hum then return nil end
-		hum:EquipTool(knife)
-		delay(0.15)
-		knife = char:FindFirstChild("Knife")
-		if not knife then return nil end
+	local tool = char:FindFirstChildOfClass("Tool")
+	if tool and tool:FindFirstChild("HitEvent") then
+		local hitEvent = tool:FindFirstChild("HitEvent")
+		local playSound = tool:FindFirstChild("PlaySound")
+		local handle = tool:FindFirstChild("Handle")
+		-- 挥击音效通用探测：Handle 下第一个 Sound（Knife 是 Swing，其他武器名字可能不同）
+		local swing = handle and (handle:FindFirstChild("Swing") or handle:FindFirstChildWhichIsA("Sound"))
+		if hitEvent and playSound and swing then
+			return hitEvent, playSound, swing
+		end
+		return nil
 	end
-	local hitEvent = knife:FindFirstChild("HitEvent")
-	local playSound = knife:FindFirstChild("PlaySound")
-	local handle = knife:FindFirstChild("Handle")
-	local swing = handle and handle:FindFirstChild("Swing")
-	if not hitEvent or not playSound or not swing then return nil end
-	return hitEvent, playSound, swing
+	-- 手上不是近战（枪/空手）：从背包找近战装备
+	local bp = lp:FindFirstChild("Backpack")
+	if bp then
+		for _, t in ipairs(bp:GetChildren()) do
+			if t:IsA("Tool") and t:FindFirstChild("HitEvent") then
+				local hum = char:FindFirstChildOfClass("Humanoid")
+				if hum then
+					hum:EquipTool(t)
+				end
+				break
+			end
+		end
+	end
+	return nil
 end
 
 -- ================= 服务器反馈监控（TextEvent = 反作弊警告通道）=================
@@ -222,62 +211,41 @@ task.spawn(function()
 			local char = lp.Character
 			hrp = char and char:FindFirstChild("HumanoidRootPart")
 			if hrp and hrp.Parent then
-				-- 位置钉定（HRP 保持非锚定以维持网络所有权，Handle/协议复制才有效）
-				if State.AnchorChar and AnchorPos then
-					-- 定身模式：钉回用户锚点
-					hrp.Anchored = false
-					hrp.CFrame = CFrame.new(AnchorPos)
-					hrp.AssemblyLinearVelocity = Vector3.zero
-				elseif not State.AnchorChar then
-					-- 站桩模式：钉回开启点（防怪推搡位移），角色零移动原地清怪
-					if StandPos == nil then
-						StandPos = hrp.Position
-						log("站桩点已记录")
-					end
-					hrp.Anchored = false
-					hrp.CFrame = CFrame.new(StandPos)
-					hrp.AssemblyLinearVelocity = Vector3.zero
-				end
-				local hitEvent, playSound, swing = getKnife()
+				-- 角色位置完全由玩家控制（走动光环零干预；瞬移光环打完自动回原位）
+				if hrp.Anchored then hrp.Anchored = false end
+				local hitEvent, playSound, swing = getMelee()
 				if hitEvent then
-					-- 收集范围内活怪（带 Enemy 标记，通用适配）
-					local targets = {}
-					-- 站桩模式（定身关）：角色不动，服务器命中距离上限 ~16 studs（实测 16 命中 18 失效）
-					-- 有效攻击半径取 14 留余量；范围外的怪会自己走近进入范围
-					local effRadius = State.AnchorChar and State.Radius or math.min(State.Radius, 14)
-					local r2 = effRadius * effRadius
-					local base = State.AnchorChar and AnchorPos or (hrp.Position)
+					-- 双光环目标收集（带 Enemy 标记通用适配）
+					-- 走动光环：Walk_Radius 内原地直发（角色不动）；瞬移光环：TP_Radius 内逐怪就位打完回原位
+					-- 14 格内的怪归走动光环（不瞬移），14 格外的归瞬移光环（服务器命中校验上限 ~16）
+					local walkTargets, tpTargets = {}, {}
+					local myPos = hrp.Position
+					local wr2 = State.Walk_Radius * State.Walk_Radius
+					local tr2 = State.TP_Radius * State.TP_Radius
 					for _, d in ipairs(workspace:GetDescendants()) do
 						if d:IsA("Model") and d:FindFirstChild("Enemy") and not Blacklist[d] then
 							local h = d:FindFirstChildOfClass("Humanoid")
 							if h and h.Health > 0 then
 								local root = d:FindFirstChild("HumanoidRootPart") or d:FindFirstChild("Torso") or d:FindFirstChildWhichIsA("BasePart")
 								if root then
-									local dv = root.Position - base
-									if dv:Dot(dv) <= r2 then
-										targets[#targets + 1] = { model = d, hum = h, root = root, name = d.Name }
+									local dv = root.Position - myPos
+									local d2 = dv:Dot(dv)
+									if State.Walk_Enabled and d2 <= wr2 then
+										walkTargets[#walkTargets + 1] = { model = d, hum = h, root = root, name = d.Name }
+									elseif State.TP_Enabled and d2 <= tr2 then
+										tpTargets[#tpTargets + 1] = { model = d, hum = h, root = root, name = d.Name }
 									end
 								end
 							end
 						end
 					end
-					State.Stat.Targets = #targets
-					-- 一次挥击 + 全目标收割（反编译实锤：防重表按怪计，一次挥击可结算多个不同目标）
-					-- 服务器统计挥击频率踢人（"Swinging too fast"）：每轮只发 1 次 PlaySound，节奏由 Interval 控制（≥0.22 模拟正常连点）
-					if #targets > 0 then
-						if State.AnchorChar then
-							-- 定身模式：瞬移到第一个怪旁就位（一次就位，HitEvent 协议直发不依赖物理挥砍）
-							local t1 = targets[1]
-							hrp.CFrame = CFrame.lookAt(t1.root.Position + t1.root.CFrame.LookVector * 3.5, t1.root.Position)
-							delay(0.06)
-						end
+					State.Stat.Targets = #walkTargets + #tpTargets
+					if State.Stat.Targets > 0 then
+						-- 共享挥击：每轮只发 1 次 PlaySound（服务器统计挥击频率踢人，两光环共用节拍）
 						playSound:FireServer("Play", swing)
-						for _, t in ipairs(targets) do
+						-- 1) 走动光环：原地直发，角色零干预
+						for _, t in ipairs(walkTargets) do
 							if not State.Enabled then break end
-							if State.AnchorChar and AnchorPos then
-								-- 定身模式：逐怪就位（瞬移瞬时可完成，服务器看到的位置即时生效）
-								hrp.CFrame = CFrame.lookAt(t.root.Position + t.root.CFrame.LookVector * 3.5, t.root.Position)
-							end
 							if t.hum.Parent and t.hum.Health > 0 then
 								local pre = t.hum.Health
 								hitEvent:FireServer(t.model, t.hum)
@@ -289,14 +257,29 @@ task.spawn(function()
 								end
 							end
 						end
-						-- 回锚点（定身模式下不被拖走）
-						if State.AnchorChar and AnchorPos then
-							hrp.CFrame = CFrame.new(AnchorPos)
+						-- 2) 瞬移光环：逐怪就位打，全部打完回原位
+						if #tpTargets > 0 then
+							local returnCf = hrp.CFrame
+							for _, t in ipairs(tpTargets) do
+								if not State.Enabled then break end
+								if t.hum.Parent and t.hum.Health > 0 then
+									local pre = t.hum.Health
+									hrp.CFrame = CFrame.lookAt(t.root.Position + t.root.CFrame.LookVector * 3.5, t.root.Position)
+									hitEvent:FireServer(t.model, t.hum)
+									State.Stat.Hits += 1
+									if t.hum.Health <= 0 and pre > 0 then
+										State.Stat.Kills += 1
+										Blacklist[t.model] = true
+										log("击杀 " .. t.name)
+									end
+								end
+							end
+							hrp.CFrame = returnCf
 						end
 					end
 					delay(math.max(AdaptiveInterval or State.Interval, 0.2))
 				else
-					log("未找到 Knife（需要背包有刀）")
+					log("未找到近战武器（需要带 HitEvent 的 Tool，会自动装备）")
 					delay(1)
 				end
 			else
@@ -308,5 +291,5 @@ task.spawn(function()
 	end
 end)
 
-Library:Notify("杀戮光环 v1.4 已加载", 4)
-print("[杀戮光环] v1.4 加载完成")
+Library:Notify("杀戮光环 v1.6 已加载", 4)
+print("[杀戮光环] v1.6 加载完成")
