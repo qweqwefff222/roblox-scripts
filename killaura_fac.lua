@@ -1,5 +1,5 @@
 --[[
-	杀戮光环 v1.2 · 在设施翻新中生存（placeId 107946054053457）· Obsidian 全中文
+	杀戮光环 v1.4 · 在设施翻新中生存（placeId 107946054053457）· Obsidian 全中文
 	协议（反编译+实测实锤）：
 	  Knife.HitEvent:FireServer(怪Model, 怪Humanoid)   —— 一刀 50 伤害
 	  Knife.PlaySound:FireServer("Play", Handle.Swing) —— 挥击音效（伴随发送）
@@ -20,7 +20,7 @@ local lp = Players.LocalPlayer
 local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/deividcomsono/Obsidian/refs/heads/main/Library.lua"))()
 local Window = Library:CreateWindow({
 	Title = "杀戮光环",
-	Footer = "v1.2 · 设施生存",
+	Footer = "v1.4 · 设施生存",
 	ToggleKeybind = Enum.KeyCode.RightControl,
 	Center = true,
 	AutoShow = true,
@@ -31,7 +31,7 @@ local TabStat = Window:AddTab("状态", "activity")
 local State = {
 	Enabled = false,        -- 总开关
 	Radius = 30,            -- 光环范围（studs）
-	Interval = 0.1,         -- 攻击间隔（秒；<0.05 服务器会丢包）
+	Interval = 0.25,        -- 挥击节奏（秒）：服务器统计挥击频率踢人（"Swinging too fast"），≥0.22 模拟正常连点；每轮一次挥击全目标结算
 	AnchorChar = true,      -- 定身（瞬移清怪不被围攻拖走）
 	Stat = { Hits = 0, Kills = 0, Targets = 0, Dna = 0 },
 }
@@ -85,7 +85,7 @@ grpParam:AddSlider("Radius", {
 	Callback = function(v) State.Radius = v end,
 })
 grpParam:AddSlider("Interval", {
-	Text = "攻击间隔（<0.05 会丢包）", Default = 0.1, Min = 0.05, Max = 1, Rounding = 2, Suffix = "秒",
+	Text = "挥击节奏（≥0.22 安全，0.1 持续会被踢）", Default = 0.25, Min = 0.2, Max = 2, Rounding = 2, Suffix = "秒",
 	Callback = function(v) State.Interval = v end,
 })
 grpParam:AddToggle("AnchorChar", {
@@ -171,7 +171,7 @@ task.spawn(function()
 		if kind == "Cooldown" then
 			-- 攻击过快警告：退避
 			backoffLevel = math.min(backoffLevel + 1, 6)
-			AdaptiveInterval = math.max(State.Interval, 0.1) * (1 + backoffLevel)
+			AdaptiveInterval = math.max(State.Interval, 0.25) * (1 + backoffLevel)
 			log("服务器冷却警告（间隔提至 " .. string.format("%.2f", AdaptiveInterval) .. "s）：" .. t:sub(1, 40))
 		elseif kind == "Message" then
 			local low = t:lower()
@@ -196,7 +196,7 @@ task.spawn(function()
 						AdaptiveInterval = nil
 						log("间隔已恢复正常")
 					else
-						AdaptiveInterval = math.max(State.Interval, 0.1) * (1 + backoffLevel)
+						AdaptiveInterval = math.max(State.Interval, 0.25) * (1 + backoffLevel)
 					end
 				end
 			end
@@ -262,33 +262,39 @@ task.spawn(function()
 						end
 					end
 					State.Stat.Targets = #targets
-					-- 逐个攻击
-					for _, t in ipairs(targets) do
-						if not State.Enabled then break end
-						if t.hum.Parent and t.hum.Health > 0 then
-							local pre = t.hum.Health
-							if State.AnchorChar then
-								-- 定身模式：瞬移到怪旁 3.5 studs 面朝怪（服务器距离校验范围内）
-								hrp.CFrame = CFrame.lookAt(t.root.Position + t.root.CFrame.LookVector * 3.5, t.root.Position)
-								delay(0.08) -- 就位
-							end
-							-- 站桩模式：角色零移动，原地直发协议（目标已按 14 studs 过滤）
-							playSound:FireServer("Play", swing)
-							hitEvent:FireServer(t.model, t.hum)
-							State.Stat.Hits += 1
-							delay(0.05)
-							if t.hum.Health <= 0 and pre > 0 then
-								State.Stat.Kills += 1
-								Blacklist[t.model] = true
-								log("击杀 " .. t.name)
-							end
-							-- 回锚点（定身模式下攻击间不被拖走）
+					-- 一次挥击 + 全目标收割（反编译实锤：防重表按怪计，一次挥击可结算多个不同目标）
+					-- 服务器统计挥击频率踢人（"Swinging too fast"）：每轮只发 1 次 PlaySound，节奏由 Interval 控制（≥0.22 模拟正常连点）
+					if #targets > 0 then
+						if State.AnchorChar then
+							-- 定身模式：瞬移到第一个怪旁就位（一次就位，HitEvent 协议直发不依赖物理挥砍）
+							local t1 = targets[1]
+							hrp.CFrame = CFrame.lookAt(t1.root.Position + t1.root.CFrame.LookVector * 3.5, t1.root.Position)
+							delay(0.06)
+						end
+						playSound:FireServer("Play", swing)
+						for _, t in ipairs(targets) do
+							if not State.Enabled then break end
 							if State.AnchorChar and AnchorPos then
-								hrp.CFrame = CFrame.new(AnchorPos)
+								-- 定身模式：逐怪就位（瞬移瞬时可完成，服务器看到的位置即时生效）
+								hrp.CFrame = CFrame.lookAt(t.root.Position + t.root.CFrame.LookVector * 3.5, t.root.Position)
+							end
+							if t.hum.Parent and t.hum.Health > 0 then
+								local pre = t.hum.Health
+								hitEvent:FireServer(t.model, t.hum)
+								State.Stat.Hits += 1
+								if t.hum.Health <= 0 and pre > 0 then
+									State.Stat.Kills += 1
+									Blacklist[t.model] = true
+									log("击杀 " .. t.name)
+								end
 							end
 						end
+						-- 回锚点（定身模式下不被拖走）
+						if State.AnchorChar and AnchorPos then
+							hrp.CFrame = CFrame.new(AnchorPos)
+						end
 					end
-					delay(math.max(AdaptiveInterval or State.Interval, 0.05))
+					delay(math.max(AdaptiveInterval or State.Interval, 0.2))
 				else
 					log("未找到 Knife（需要背包有刀）")
 					delay(1)
@@ -302,5 +308,5 @@ task.spawn(function()
 	end
 end)
 
-Library:Notify("杀戮光环 v1.2 已加载", 4)
-print("[杀戮光环] v1.2 加载完成")
+Library:Notify("杀戮光环 v1.4 已加载", 4)
+print("[杀戮光环] v1.4 加载完成")
