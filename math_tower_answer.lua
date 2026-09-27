@@ -125,6 +125,53 @@ local function toNumber(s)
     return nil
 end
 
+-- ---------- 方程求解: 4 x ? = 40 / ? + 5 = 12 / 3 + 4 = ??? ----------
+local OPSF = {
+    ["+"] = function(x, y) return x + y end,
+    ["-"] = function(x, y) return x - y end,
+    ["*"] = function(x, y) return x * y end,
+    ["/"] = function(x, y) return x / y end,
+}
+local function solveEquation(s)
+    -- 形式A: a op b = ??? (无未知数, 纯计算)
+    local a, op, b = s:match("^%s*(%-?%d+%.?%d*)%s*([%+%-%*xX/])%s*(%-?%d+%.?%d*)%s*=%s*%?+")
+    if a then
+        if op == "x" or op == "X" then op = "*" end
+        local f = OPSF[op]
+        if f then
+            local n = f(tonumber(a), tonumber(b))
+            if n then return {text = fmt(n), num = n} end
+        end
+    end
+    -- 形式B: ? 在左: ? op b = r
+    local q1, op1, b1, r1 = s:match("^%s*([%?%d]+%.?%d*)%s*([%+%-%*xX/])%s*(%-?%d+%.?%d*)%s*=%s*(%-?%d+%.?%d*)")
+    if q1 and (q1:find("?") or q1:find("\u{FF1F}")) then
+        if op1 == "x" or op1 == "X" then op1 = "*" end
+        local nb, nr = tonumber(b1), tonumber(r1)
+        local n
+        if op1 == "+" then n = nr - nb
+        elseif op1 == "-" then n = nr + nb
+        elseif op1 == "*" and nb ~= 0 then n = nr / nb
+        elseif op1 == "/" then n = nr * nb
+        end
+        if n then return {text = fmt(n), num = n} end
+    end
+    -- 形式C: ? 在中: a op ? = r
+    local a2, op2, q2, r2 = s:match("^%s*(%-?%d+%.?%d*)%s*([%+%-%*xX/])%s*([%?%d]+%.?%d*)%s*=%s*(%-?%d+%.?%d*)")
+    if a2 and q2 and (q2:find("?") or q2:find("\u{FF1F}")) then
+        if op2 == "x" or op2 == "X" then op2 = "*" end
+        local na, nr = tonumber(a2), tonumber(r2)
+        local n
+        if op2 == "+" then n = nr - na
+        elseif op2 == "-" then n = na - nr
+        elseif op2 == "*" and na ~= 0 then n = nr / na
+        elseif op2 == "/" then n = na / nr
+        end
+        if n then return {text = fmt(n), num = n} end
+    end
+    return nil
+end
+
 -- ---------- 各题型解析: 返回 {text=答案文本, num=数值} 或 nil ----------
 local function parseQuestion(qtype, q)
     if typeof(q) ~= "string" or q == "" then return nil end
@@ -142,11 +189,15 @@ local function parseQuestion(qtype, q)
         return f(tonumber(a), tonumber(b))
     end
 
-    if qtype == "add" or qtype == "sub" or qtype == "mul" or qtype == "div" then
+    local isBasicPro = (qtype == "add" or qtype == "sub" or qtype == "mul" or qtype == "div")
+        or (qtype:find("^pro_") == 1 and (qtype:find("add") or qtype:find("sub") or qtype:find("mul") or qtype:find("div")))
+    if isBasicPro then
         local n = twoNumOp()
         if n then return {text = fmt(n), num = n} end
+        -- pro_ 系列是 ? 方程(? + 12 = 1 等), 走方程求解
+        return solveEquation(s)
 
-    elseif qtype == "exp" or qtype == "pro_exp" or qtype == "pro_exp3" then
+    elseif qtype == "exp" or qtype:find("^pro_exp") == 1 then
         -- 9² / 2³ / 1³ = ? / 9^2  (上标字符双字节, 先归一化成 ^n 再匹配)
         s = s
             :gsub("\u{00B2}", "^2"):gsub("\u{00B3}", "^3"):gsub("\u{00B9}", "^1")
@@ -159,25 +210,8 @@ local function parseQuestion(qtype, q)
             return {text = fmt(n), num = n}
         end
 
-    elseif qtype == "algebra" then
-        -- 4 x ? = 40 / ? + 5 = 12 / 12 - ? = 5 / ? ÷ 3 = 4
-        local a, op, b, r = s:match("^%s*(%-?%d+%.?%d*)%s*([%+%-%*xX/])%s*([%?%d]+%.?%d*)%s*=%s*(%-?%d+%.?%d*)")
-        if not a then
-            a, op, b, r = s:match("^%s*([%?%d]+%.?%d*)%s*([%+%-%*xX/])%s*(%-?%d+%.?%d*)%s*=%s*(%-?%d+%.?%d*)")
-        end
-        if a then
-            if op == "x" or op == "X" then op = "*" end
-            local na, nb, nr = tonumber(a), tonumber(b), tonumber(r)
-            local isQ1 = a:find("?") or a:find("？")
-            local isQ2 = tostring(b):find("?") or tostring(b):find("？")
-            local n
-            if op == "+" then n = isQ1 and (nr - nb) or (nr - na)
-            elseif op == "-" then n = isQ1 and (nr + nb) or (na - nr)
-            elseif op == "*" then n = isQ1 and (nr / nb) or (nr / na)
-            elseif op == "/" then n = isQ1 and (nr * nb) or (na / nr)
-            end
-            if n then return {text = fmt(n), num = n} end
-        end
+    elseif qtype == "algebra" or qtype:find("algebra") == 1 then
+        return solveEquation(s)
 
     elseif qtype == "seq_arithmetic" or qtype == "seq_geometric" or qtype == "seq" then
         -- 数列: 2, 4, 6, ? / 3, 9, ?, 81 (? 可在任意位置)
@@ -709,6 +743,19 @@ local function handleTopic()
     local myGen = INST.gen
     task.spawn(function()
         local delay, tag = pickDelay()
+        -- 按题目剩余时间截短延迟, 避免交上去已超时(返回 rate_limit)
+        local tv = TopicControl:FindFirstChild("TimerValue")
+        local remain = tv and tonumber(tv.Value) or nil
+        if remain and remain < delay + 1 then
+            if remain < 1.2 then
+                log(string.format("跳过(剩余%.0fs不足) | %s", remain, q))
+                setStatus(string.format("剩余时间不足(%.0fs), 跳过", remain))
+                return
+            end
+            delay = math.max(0.2, remain - 1)
+            tag = tag .. "-截短"
+            log(string.format("延迟按剩余时间截短为%.1fs | %s", delay, q))
+        end
         setStatus(string.format("%s %s = %s | %s延迟%.1fs", q, "→", opt, tag, delay))
         local t0 = os.clock()
         while os.clock() - t0 < delay do
