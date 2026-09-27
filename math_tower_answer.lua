@@ -500,11 +500,12 @@ local function findOption(ans)
                 -- 数值匹配
                 local ov, kind = toNumber(opt)
                 if ov then
-                    if ans.num ~= nil and math.abs(ov - ans.num) < 1e-6 then
+                    local tol = ans.tol or 1e-6
+                    if ans.num ~= nil and math.abs(ov - ans.num) < tol then
                         return opt
                     end
                     -- 百分比选项 vs 小数值
-                    if kind == "pct" and ans.num ~= nil and math.abs(ov - ans.num * 100) < 1e-6 then
+                    if kind == "pct" and ans.num ~= nil and math.abs(ov - ans.num * 100) < tol then
                         return opt
                     end
                     -- 百分比答案文本 vs 数值选项
