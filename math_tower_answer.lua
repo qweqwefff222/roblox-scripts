@@ -180,29 +180,47 @@ local function parseQuestion(qtype, q)
         end
 
     elseif qtype == "seq_arithmetic" or qtype == "seq_geometric" or qtype == "seq" then
-        -- 2, 4, 6, ?
-        local nums = {}
-        for n in s:gmatch("(%-?%d+%.?%d*)") do
-            table.insert(nums, tonumber(n))
-        end
-        if #nums >= 3 then
-            local d = nums[2] - nums[1]
-            local isArith = true
-            for i = 3, #nums do
-                if math.abs((nums[i] - nums[i-1]) - d) > 1e-6 then isArith = false break end
+        -- 数列: 2, 4, 6, ? / 3, 9, ?, 81 (? 可在任意位置)
+        local known = {}
+        local missingIdx = nil
+        local idx = 0
+        for tok in s:gmatch("[^,]+") do
+            idx = idx + 1
+            local n = tonumber(tok:match("(%-?%d+%.?%d*)"))
+            if n then
+                known[#known + 1] = {i = idx, v = n}
+            else
+                missingIdx = idx
             end
-            if isArith then
-                local n = nums[#nums] + d
+        end
+        if missingIdx and #known >= 2 then
+            -- 等差
+            local d, ok = nil, true
+            for k = 2, #known do
+                local dd = (known[k].v - known[k-1].v) / (known[k].i - known[k-1].i)
+                if d == nil then d = dd
+                elseif math.abs(dd - d) > 1e-6 then ok = false break end
+            end
+            if ok and d then
+                local base = known[1]
+                local n = base.v + d * (missingIdx - base.i)
                 return {text = fmt(n), num = n}
             end
-            if nums[1] ~= 0 then
-                local rt = nums[2] / nums[1]
-                local isGeo = true
-                for i = 3, #nums do
-                    if math.abs(nums[i-1] * rt - nums[i]) > 1e-6 then isGeo = false break end
+            -- 等比(需全正数)
+            local allPos = true
+            for _, kv in ipairs(known) do
+                if kv.v <= 0 then allPos = false break end
+            end
+            if allPos then
+                local r, ok2 = nil, true
+                for k = 2, #known do
+                    local rr = (known[k].v / known[k-1].v) ^ (1 / (known[k].i - known[k-1].i))
+                    if r == nil then r = rr
+                    elseif math.abs(rr - r) > 1e-6 then ok2 = false break end
                 end
-                if isGeo then
-                    local n = nums[#nums] * rt
+                if ok2 and r then
+                    local base = known[1]
+                    local n = base.v * r ^ (missingIdx - base.i)
                     return {text = fmt(n), num = n}
                 end
             end
@@ -238,11 +256,22 @@ local function parseQuestion(qtype, q)
         end
 
     elseif qtype == "percentageToFraction" then
-        -- 50% = ?
+        -- 50% = ? / 33.3% = ?  → 找最接近的小分母分数(33.3% → 1/3)
         local p = tonumber(s:match("(%-?%d+%.?%d*)%s*%%"))
         if p then
-            local f = fracStr(math.floor(p + 0.5), 100)
-            if f then return {text = f, num = p / 100} end
+            local target = p / 100
+            local bestN, bestD, bestErr = nil, nil, 1e9
+            for den = 1, 16 do
+                local num = math.floor(target * den + 0.5)
+                local err = math.abs(num / den - target)
+                if err < bestErr then
+                    bestErr, bestN, bestD = err, num, den
+                end
+            end
+            if bestN and bestN > 0 and bestErr <= 0.005 then
+                local f = fracStr(bestN, bestD)
+                if f then return {text = f, num = target, tol = 0.005} end
+            end
         end
 
     elseif qtype == "simpleComparison" or qtype == "fractionComparison" then
@@ -312,10 +341,15 @@ local function parseQuestion(qtype, q)
                 n = (qtype == "perimeterOfShape") and a * 4 or a * a
             elseif sh == "rectangle" and b then
                 n = (qtype == "perimeterOfShape") and (a + b) * 2 or a * b
-            elseif sh == "triangle" and qtype == "perimeterOfShape" then
+            elseif sh == "triangle" then
                 local s3 = sc:FindFirstChild("Side3")
                 local c = s3 and tonumber(s3.Value)
-                if c then n = a + b + c end
+                if qtype == "areaOfShape" then
+                    -- 三角形面积 = 底 × 高 × 1/2 (Side1=底, Side2=高)
+                    if b then n = a * b / 2 end
+                elseif c then
+                    n = a + b + c
+                end
             end
             if n then return {text = fmt(n), num = n} end
         end
