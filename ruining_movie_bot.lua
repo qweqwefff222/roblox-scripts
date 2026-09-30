@@ -322,7 +322,19 @@ task.spawn(function()
             setLooking(false)
 
             if not canAct() then
-                setStatus("未进入游戏/未装备背包")
+                -- 自动装备背包(Stowed=没装备)
+                if lp:GetAttribute("CinemaBackpackState") == "Stowed" then
+                    local bp = lp.Backpack and lp.Backpack:FindFirstChild("Backpack")
+                    local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+                    if bp and hum and bp:GetAttribute("CinemaBackpackTool") == true then
+                        hum:EquipTool(bp)
+                        setStatus("自动装备背包中(unzip)...")
+                        return
+                    end
+                    setStatus("未进入游戏/找不到背包工具")
+                    return
+                end
+                setStatus(string.format("待机(状态=%s 段=%s)", tostring(lp:GetAttribute("CinemaBackpackState")), seg))
                 return
             end
 
