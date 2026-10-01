@@ -1,5 +1,5 @@
 --[[
-    完成这个词 · 自动答题 v1.2 拟人版
+    完成这个词 · 自动答题 v1.2.5 拟人版
     ============ 协议(反编译确认) ============
     - 上行: RemoteFunction:InvokeServer("keyStroke", 键名) 逐键(A-Z) + ("tryAnswer") 提交
     - 光标起始 = #RequiredLetter (前缀预填, 只发后缀!)
@@ -36,8 +36,8 @@ local state = {
     rMin = 1.0,          -- 随机下限
     rMax = 3.0,          -- 随机上限
     humanType = true,    -- 拟人打字(错按修正+变速)
-    keyMin = 0.10,       -- 键入间隔下限
-    keyMax = 0.28,       -- 键入间隔上限
+    keyMin = 0.30,       -- 键入间隔下限(>=网络往返0.3s)
+    keyMax = 0.60,       -- 键入间隔上限
     typoChance = 0.04,   -- 每词错按概率
 }
 getgenv()._WC_STATE = state  -- 暴露配置供实时验证
@@ -313,11 +313,11 @@ makeToggle("拟人打字(错按修正)", 216, function() return state.humanType 
     state.humanType = v
 end)
 
-makeSlider(246, "键入间隔下限: %.2f秒", 0.05, 0.4, state.keyMin, 0.01, function(v)
+makeSlider(246, "键入间隔下限: %.2f秒", 0.3, 1.0, state.keyMin, 0.05, function(v)
     state.keyMin = v
 end)
 
-makeSlider(278, "键入间隔上限: %.2f秒", 0.1, 0.8, state.keyMax, 0.02, function(v)
+makeSlider(278, "键入间隔上限: %.2f秒", 0.4, 2.0, state.keyMax, 0.05, function(v)
     state.keyMax = v
 end)
 
@@ -389,12 +389,10 @@ local function humanPause(lo, hi)
 end
 
 -- 拟人逐键: 随机间隔 + 偶尔错按→停顿→退格→改对 + 偶尔思考停顿
--- 异步发键: InvokeServer必须同步校验, 但用独立协程包裹→不等回包, 主循环按滑条间隔推进
--- (滑条值 = 服务器实际收到按键的节奏, 与网络往返彻底解耦)
+-- 发键必须顺序 InvokeServer(RemoteFunction 同时只允许一个未完成调用, 重叠会被丢弃)
+-- 每键实际节奏 = 滑条间隔 + 网络往返(~0.3s, 协议决定无法消除)
 local function sendKey(v)
-    task.spawn(function()
-        pcall(function() RemoteFunction:InvokeServer("keyStroke", v) end)
-    end)
+    pcall(function() RemoteFunction:InvokeServer("keyStroke", v) end)
 end
 
 local function typeSuffix(suffix)
@@ -413,15 +411,13 @@ local function typeSuffix(suffix)
             end
         end
         sendKey(ch)
-        -- 键入间隔: 异步发键后这就是真实节奏(无RTT叠加)
+        -- 键入间隔
         task.wait(state.keyMin + math.random() * (state.keyMax - state.keyMin))
         -- 偶尔中途思考停顿
         if state.humanType and math.random() < 0.07 then
             humanPause(0.3, 0.8)
         end
     end
-    -- 尾部缓冲: 等最后一个键到达服务器再提交
-    task.wait(0.4 + math.random() * 0.3)
 end
 
 -- 监听4条入站通道
@@ -523,7 +519,7 @@ task.spawn(function()
     end
 end)
 
-log(string.format("[WordChain v1.2] 加载 | 词库%d词", wordCount))
+log(string.format("[WordChain v1.2.5] 加载 | 词库%d词", wordCount))
 print("[WordChain v1.2] 自动答题已加载 | 单例守护")
 
 -- ---------- kill ----------
