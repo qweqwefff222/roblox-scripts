@@ -34,6 +34,8 @@ local state = {
     collect = true,   -- 自动收集假发(隔空)
     sell = true,      -- 自动上架+收钱
     roll = true,      -- 自动免费抽奖
+    buy = true,       -- 自动买建筑(只买现金, 跳过宝石)
+    fix = true,       -- 自动修理
     collectGap = 0.8, -- 收集间隔
 }
 -- ========================================
@@ -71,7 +73,7 @@ gui.ResetOnSpawn = false
 gui.Parent = lp:WaitForChild("PlayerGui")
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.new(0, 200, 0, 160)
+frame.Size = UDim2.new(0, 200, 0, 216)
 frame.Position = UDim2.new(0, 20, 0, 140)
 frame.BackgroundColor3 = Color3.fromRGB(24, 26, 32)
 frame.BorderSizePixel = 0
@@ -129,9 +131,17 @@ makeToggle("自动免费抽奖", 88, function() return state.roll end, function(
     state.roll = v
 end)
 
+makeToggle("自动买建筑(非宝石)", 118, function() return state.buy end, function(v)
+    state.buy = v
+end)
+
+makeToggle("自动修理机器", 148, function() return state.fix end, function(v)
+    state.fix = v
+end)
+
 status = Instance.new("TextLabel")
 status.Size = UDim2.new(1, -16, 0, 42)
-status.Position = UDim2.new(0, 8, 0, 118)
+status.Position = UDim2.new(0, 8, 0, 178)
 status.BackgroundTransparency = 1
 status.Text = "状态: 等待..."
 status.TextColor3 = Color3.fromRGB(150, 200, 150)
@@ -213,6 +223,36 @@ task.spawn(function()
                 local fired = fireNearbyPrompts()
                 if fired > 0 then
                     log("触发货架/收钱 " .. fired)
+                end
+            end
+            -- 买建筑(只买$现金) + 修理
+            if (state.buy or state.fix) and now - (INST.lastBuy or 0) >= 1.5 then
+                INST.lastBuy = now
+                local bought, fixed = 0, 0
+                local myTy
+                for _, t in ipairs(game.Workspace.TycoonSystem.Tycoons:GetChildren()) do
+                    local o = t:FindFirstChild("Data") and t.Data:FindFirstChild("Owner")
+                    if o and o.Value == lp then myTy = t break end
+                end
+                if myTy then
+                    for _, d in ipairs(myTy:GetDescendants()) do
+                        if not INST.alive then break end
+                        if d:IsA("ProximityPrompt") and d.Enabled then
+                            local act = d.ActionText or ""
+                            if state.buy and act:match("^Buy: %$%d") then
+                                pcall(function() fireproximityprompt(d) end)
+                                bought = bought + 1
+                                task.wait(0.3)
+                            elseif state.fix and act == "Fix" then
+                                pcall(function() fireproximityprompt(d) end)
+                                fixed = fixed + 1
+                                task.wait(0.3)
+                            end
+                        end
+                    end
+                end
+                if bought + fixed > 0 then
+                    log(string.format("买建筑%d 修理%d", bought, fixed))
                 end
             end
             -- 抽奖
