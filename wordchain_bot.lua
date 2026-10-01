@@ -389,13 +389,21 @@ local function humanPause(lo, hi)
 end
 
 -- 拟人逐键: 随机间隔 + 偶尔错按→停顿→退格→改对 + 偶尔思考停顿
--- 发键走非阻塞 FireServer(InvokeServer会等服务器回包, 每键凭空多0.3-0.5秒)
-local RemoteEventFast = ev:WaitForChild("RemoteEvent")
+-- 发键必须走 InvokeServer(FireServer路径被服务器限流, 1-2键后丢弃)
+-- RTT补偿: InvokeServer每键自带~0.3s网络往返, 从滑条目标间隔里扣除,
+--          这样滑条值 = 你实际看到的键入节奏
+local function measureRtt()
+    local t0 = os.clock()
+    pcall(function() RemoteFunction:InvokeServer("//ping") end)
+    return os.clock() - t0
+end
+
 local function sendKey(v)
-    RemoteEventFast:FireServer("keyStroke", v)
+    RemoteFunction:InvokeServer("keyStroke", v)
 end
 
 local function typeSuffix(suffix)
+    local rtt = math.min(measureRtt(), 0.6) -- 上限保护
     for i = 1, #suffix do
         if not INST.alive then return end
         local ch = suffix:sub(i, i):upper()
@@ -411,8 +419,9 @@ local function typeSuffix(suffix)
             end
         end
         sendKey(ch)
-        -- 键入间隔: 随机上下限(现在这是唯一节奏控制)
-        task.wait(state.keyMin + math.random() * (state.keyMax - state.keyMin))
+        -- 键入间隔: 目标间隔减去RTT(网络往返无法消除, 补偿后滑条=真实节奏)
+        local target = state.keyMin + math.random() * (state.keyMax - state.keyMin)
+        task.wait(math.max(0, target - rtt))
         -- 偶尔中途思考停顿
         if state.humanType and math.random() < 0.07 then
             humanPause(0.3, 0.8)
@@ -505,8 +514,8 @@ task.spawn(function()
             log(string.format("答题: req=%s word=%s suffix=%s", req, word, suffix))
             INST.lastSent = word:lower()
             typeSuffix(suffix)
-            RemoteEventFast:FireServer("tryAnswer")
-            log("FastPath提交: " .. word)
+            RemoteFunction:InvokeServer("tryAnswer")
+            log("提交: " .. word)
             markUsed(word)
             setStatus(string.format("已提交 '%s' (%s延迟%.1fs)", word, tag, delay))
             INST.lastRound = nil
