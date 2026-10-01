@@ -389,21 +389,15 @@ local function humanPause(lo, hi)
 end
 
 -- 拟人逐键: 随机间隔 + 偶尔错按→停顿→退格→改对 + 偶尔思考停顿
--- 发键必须走 InvokeServer(FireServer路径被服务器限流, 1-2键后丢弃)
--- RTT补偿: InvokeServer每键自带~0.3s网络往返, 从滑条目标间隔里扣除,
---          这样滑条值 = 你实际看到的键入节奏
-local function measureRtt()
-    local t0 = os.clock()
-    pcall(function() RemoteFunction:InvokeServer("//ping") end)
-    return os.clock() - t0
-end
-
+-- 异步发键: InvokeServer必须同步校验, 但用独立协程包裹→不等回包, 主循环按滑条间隔推进
+-- (滑条值 = 服务器实际收到按键的节奏, 与网络往返彻底解耦)
 local function sendKey(v)
-    RemoteFunction:InvokeServer("keyStroke", v)
+    task.spawn(function()
+        pcall(function() RemoteFunction:InvokeServer("keyStroke", v) end)
+    end)
 end
 
 local function typeSuffix(suffix)
-    local rtt = math.min(measureRtt(), 0.6) -- 上限保护
     for i = 1, #suffix do
         if not INST.alive then return end
         local ch = suffix:sub(i, i):upper()
@@ -419,14 +413,15 @@ local function typeSuffix(suffix)
             end
         end
         sendKey(ch)
-        -- 键入间隔: 目标间隔减去RTT(网络往返无法消除, 补偿后滑条=真实节奏)
-        local target = state.keyMin + math.random() * (state.keyMax - state.keyMin)
-        task.wait(math.max(0, target - rtt))
+        -- 键入间隔: 异步发键后这就是真实节奏(无RTT叠加)
+        task.wait(state.keyMin + math.random() * (state.keyMax - state.keyMin))
         -- 偶尔中途思考停顿
         if state.humanType and math.random() < 0.07 then
             humanPause(0.3, 0.8)
         end
     end
+    -- 尾部缓冲: 等最后一个键到达服务器再提交
+    task.wait(0.4 + math.random() * 0.3)
 end
 
 -- 监听4条入站通道
