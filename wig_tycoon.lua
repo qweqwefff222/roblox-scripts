@@ -1,5 +1,5 @@
 --[[
-    剃头卖假发大亨 · 自动助手 v1.0
+    剃头卖假发大亨 · 自动助手 v1.2 极速版
     ============ 协议(实测) ============
     - 收集: RequestItemCollect:InvokeServer(rarity, false) → "match"=成功
       ✅ 无距离校验, 全图任意位置隔空收集(实测73米+)
@@ -31,12 +31,12 @@ local function bind(c) table.insert(INST.conns, c) end
 
 -- ================= 配置 =================
 local state = {
-    collect = true,   -- 自动收集假发(隔空)
-    sell = true,      -- 自动上架+收钱
+    collect = true,   -- 自动收集假发(极限速度)
+    shelf = true,     -- 自动上架(Stock Shelf)
+    cash = true,      -- 自动收钱(Collect Cash, 隔空)
     roll = true,      -- 自动免费抽奖
     buy = true,       -- 自动买建筑(只买现金, 跳过宝石)
     fix = true,       -- 自动修理
-    collectGap = 0.8, -- 收集间隔
 }
 -- ========================================
 
@@ -73,7 +73,7 @@ gui.ResetOnSpawn = false
 gui.Parent = lp:WaitForChild("PlayerGui")
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.new(0, 200, 0, 216)
+frame.Size = UDim2.new(0, 200, 0, 248)
 frame.Position = UDim2.new(0, 20, 0, 140)
 frame.BackgroundColor3 = Color3.fromRGB(24, 26, 32)
 frame.BorderSizePixel = 0
@@ -119,29 +119,33 @@ local function makeToggle(name, y, get, set)
     return btn
 end
 
-makeToggle("自动收集假发", 28, function() return state.collect end, function(v)
+makeToggle("自动收集假发(极速)", 28, function() return state.collect end, function(v)
     state.collect = v
 end)
 
-makeToggle("自动上架+收钱", 58, function() return state.sell end, function(v)
-    state.sell = v
+makeToggle("自动上架", 58, function() return state.shelf end, function(v)
+    state.shelf = v
 end)
 
-makeToggle("自动免费抽奖", 88, function() return state.roll end, function(v)
+makeToggle("自动收钱", 88, function() return state.cash end, function(v)
+    state.cash = v
+end)
+
+makeToggle("自动免费抽奖", 118, function() return state.roll end, function(v)
     state.roll = v
 end)
 
-makeToggle("自动买建筑(非宝石)", 118, function() return state.buy end, function(v)
+makeToggle("自动买建筑(非宝石)", 148, function() return state.buy end, function(v)
     state.buy = v
 end)
 
-makeToggle("自动修理机器", 148, function() return state.fix end, function(v)
+makeToggle("自动修理机器", 178, function() return state.fix end, function(v)
     state.fix = v
 end)
 
 status = Instance.new("TextLabel")
 status.Size = UDim2.new(1, -16, 0, 42)
-status.Position = UDim2.new(0, 8, 0, 178)
+status.Position = UDim2.new(0, 8, 0, 208)
 status.BackgroundTransparency = 1
 status.Text = "状态: 等待..."
 status.TextColor3 = Color3.fromRGB(150, 200, 150)
@@ -152,52 +156,75 @@ status.TextYAlignment = Enum.TextYAlignment.Top
 status.TextWrapped = true
 status.Parent = frame
 
--- ---------- 收集 ----------
+-- ---------- 收集(极限速度专职线程) ----------
 local collected = 0
-local function collectAll()
-    local got = 0
-    for r = 1, 6 do
-        local ok, res = pcall(function()
-            return CollectRemote:InvokeServer(r, false)
-        end)
-        if ok and res == "match" then
-            got = got + 1
-            collected = collected + 1
+local collectRate = 0
+task.spawn(function()
+    while INST.alive do
+        if state.collect then
+            local cycleGot, t0 = 0, os.clock()
+            for r = 1, 6 do
+                if not INST.alive then break end
+                local ok, res = pcall(function()
+                    return CollectRemote:InvokeServer(r, false)
+                end)
+                if ok and res == "match" then
+                    cycleGot = cycleGot + 1
+                    collected = collected + 1
+                end
+            end
+            local dt = os.clock() - t0
+            if dt > 0.3 then
+                collectRate = cycleGot / dt
+            end
+            if cycleGot == 0 then
+                task.wait(0.4)
+            else
+                task.wait(0.03)
+            end
+        else
+            task.wait(0.5)
         end
-        task.wait(0.08)
     end
-    return got
-end
+end)
 
 -- ---------- 上架+收钱(靠近tycoon时生效) ----------
-local function fireNearbyPrompts()
-    local fired = 0
-    local pur = game.Workspace:FindFirstChild("TycoonSystem")
-    local myTy
+local function findMyTycoon()
     for _, t in ipairs(game.Workspace.TycoonSystem.Tycoons:GetChildren()) do
         local o = t:FindFirstChild("Data") and t.Data:FindFirstChild("Owner")
-        if o and o.Value == lp then myTy = t break end
+        if o and o.Value == lp then return t end
     end
-    local containers = {}
+    return nil
+end
+
+local function firePrompts()
+    local shelfN, cashN = 0, 0
+    local myTy = findMyTycoon()
     if myTy then
+        local containers = {}
         local pur = myTy:FindFirstChild("Purchaseables")
         if pur then table.insert(containers, pur) end
         local st = myTy:FindFirstChild("Static")
         if st then table.insert(containers, st) end
-    end
-    for _, container in ipairs(containers) do
-        for _, d in ipairs(container:GetDescendants()) do
-            if INST.alive and d:IsA("ProximityPrompt") and d.Enabled then
-                local act = d.ActionText
-                if act == "Stock Shelf" or act == "Collect Cash" then
-                    pcall(function() fireproximityprompt(d) end)
-                    fired = fired + 1
-                    task.wait(0.15)
+        for _, container in ipairs(containers) do
+            for _, d in ipairs(container:GetDescendants()) do
+                if not INST.alive then break end
+                if d:IsA("ProximityPrompt") and d.Enabled then
+                    local act = d.ActionText
+                    if state.shelf and act == "Stock Shelf" then
+                        pcall(function() fireproximityprompt(d) end)
+                        shelfN = shelfN + 1
+                        task.wait(0.1)
+                    elseif state.cash and act == "Collect Cash" then
+                        pcall(function() fireproximityprompt(d) end)
+                        cashN = cashN + 1
+                        task.wait(0.1)
+                    end
                 end
             end
         end
     end
-    return fired
+    return shelfN, cashN
 end
 
 -- ---------- 抽奖 ----------
@@ -209,20 +236,12 @@ task.spawn(function()
     while INST.alive do
         local ok, err = pcall(function()
             local now = os.clock()
-            -- 收集
-            if state.collect and now - (INST.lastCollect or 0) >= state.collectGap then
-                INST.lastCollect = now
-                local got = collectAll()
-                if got > 0 then
-                    log("收集 " .. got .. " 件")
-                end
-            end
             -- 上架+收钱
-            if state.sell and now - (INST.lastSell or 0) >= 1.2 then
+            if (state.shelf or state.cash) and now - (INST.lastSell or 0) >= 1.0 then
                 INST.lastSell = now
-                local fired = fireNearbyPrompts()
-                if fired > 0 then
-                    log("触发货架/收钱 " .. fired)
+                local sn, cn = firePrompts()
+                if sn + cn > 0 then
+                    log(string.format("上架%d 收钱%d", sn, cn))
                 end
             end
             -- 买建筑(只买$现金) + 修理
@@ -269,7 +288,7 @@ task.spawn(function()
             end
             -- 状态
             local cd = math.max(0, nextRollTry - now)
-            setStatus(string.format("收集%d | 抽奖%d (冷却%.0fs)", collected, rollOk, cd))
+            setStatus(string.format("收集%d (%.1f/s) | 抽奖%d 冷却%.0fs", collected, collectRate, rollOk, cd))
         end)
         if not ok then
             log("主循环异常: " .. tostring(err))
@@ -278,7 +297,7 @@ task.spawn(function()
     end
 end)
 
-log("[WigTycoon v1.0] 加载")
+log("[WigTycoon v1.2] 加载")
 print("[WigTycoon v1.0] 自动助手已加载 | 单例守护")
 
 -- ---------- kill ----------
