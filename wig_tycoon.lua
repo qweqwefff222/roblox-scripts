@@ -38,6 +38,7 @@ local state = {
     buy = true,       -- 自动买建筑(只买现金, 跳过宝石)
     fix = true,       -- 自动修理
     upgrade = true,   -- 自动升级机器
+    highOnly = true,  -- 只收集3级及以上假发
 }
 -- ========================================
 
@@ -74,7 +75,7 @@ gui.ResetOnSpawn = false
 gui.Parent = lp:WaitForChild("PlayerGui")
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.new(0, 200, 0, 278)
+frame.Size = UDim2.new(0, 200, 0, 308)
 frame.Position = UDim2.new(0, 20, 0, 140)
 frame.BackgroundColor3 = Color3.fromRGB(24, 26, 32)
 frame.BorderSizePixel = 0
@@ -148,9 +149,13 @@ makeToggle("自动升级机器", 208, function() return state.upgrade end, funct
     state.upgrade = v
 end)
 
+makeToggle("只收3级及以上", 238, function() return state.highOnly end, function(v)
+    state.highOnly = v
+end)
+
 status = Instance.new("TextLabel")
 status.Size = UDim2.new(1, -16, 0, 42)
-status.Position = UDim2.new(0, 8, 0, 238)
+status.Position = UDim2.new(0, 8, 0, 268)
 status.BackgroundTransparency = 1
 status.Text = "状态: 等待..."
 status.TextColor3 = Color3.fromRGB(150, 200, 150)
@@ -168,10 +173,12 @@ local collected = 0
 local sendCount = 0
 local pending = 0
 task.spawn(function()
-    local r = 1
+    local idx = 1
     while INST.alive do
         if state.collect then
-            local rr = r
+            -- 目标稀有度: 全收=1..6 / 只收3级及以上=3..6
+            local targets = state.highOnly and {3, 4, 5, 6} or {1, 2, 3, 4, 5, 6}
+            local rr = targets[idx]
             if pending < 64 then
                 pending = pending + 1
                 task.spawn(function()
@@ -185,8 +192,8 @@ task.spawn(function()
                 end)
                 sendCount = sendCount + 1
             end
-            r = r % 6 + 1
-            task.wait(0.01) -- 你要求的0.01秒间隔
+            idx = idx % #targets + 1
+            task.wait(0.01)
         else
             task.wait(0.1)
         end
@@ -280,7 +287,7 @@ task.spawn(function()
             end
             -- 状态
             local cd = math.max(0, nextRollTry - now)
-            setStatus(string.format("收取%d件/发包%d 在途%d | 抽奖%d 冷却%.0fs", collected, sendCount, pending, rollOk, cd))
+            setStatus(string.format("收取%d件/发包%d 在途%d [%s] | 抽奖%d 冷却%.0fs", collected, sendCount, pending, state.highOnly and "3级+" or "全等级", rollOk, cd))
         end)
         if not ok then
             log("主循环异常: " .. tostring(err))
