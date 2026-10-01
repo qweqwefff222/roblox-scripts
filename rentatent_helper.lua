@@ -29,7 +29,7 @@ local state = {
     money = true,   -- 自动收钱+消费(合并)
     boxes = false,  -- 自动箱子上架
     clean = false,  -- 自动清理帐篷
-    gap = 0.6,      -- 扫描间隔
+    gap = 2,        -- 全图扫描间隔(事件触发是实时的)
 }
 -- 触发规则: {动作文本匹配, 归属开关}
 local RULES = {
@@ -68,7 +68,7 @@ Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
 local title = Instance.new("TextLabel")
 title.Size = UDim2.new(1, 0, 0, 24)
 title.BackgroundTransparency = 1
-title.Text = "租赁帐篷 自动助手"
+title.Text = "租赁帐篷 全图助手"
 title.TextColor3 = Color3.fromRGB(235, 235, 245)
 title.Font = Enum.Font.GothamBold
 title.TextSize = 12
@@ -127,6 +127,42 @@ status.TextYAlignment = Enum.TextYAlignment.Top
 status.TextWrapped = true
 status.Parent = frame
 
+-- ---------- 匹配函数 ----------
+local function matchRule(prompt)
+    local act = prompt.ActionText
+    if not act or act == "" then return nil end
+    for _, rule in ipairs(RULES) do
+        if state[rule.key] and act:find(rule.pat) then
+            return rule.key
+        end
+    end
+    return nil
+end
+
+local function tryFire(prompt)
+    local key = matchRule(prompt)
+    if not key then return nil end
+    local ok = pcall(function() fireproximityprompt(prompt) end)
+    if ok then
+        if key == "money" then INST.cMoney = (INST.cMoney or 0) + 1
+        elseif key == "boxes" then INST.cBoxes = (INST.cBoxes or 0) + 1
+        else INST.cClean = (INST.cClean or 0) + 1 end
+    end
+    return key, ok
+end
+
+-- ---------- 事件驱动: 全图任何位置生成匹配提示立刻触发(抢在销毁前) ----------
+bind(game.Workspace.DescendantAdded:Connect(function(d)
+    if not INST.alive then return end
+    if d.ClassName == "ProximityPrompt" then
+        task.defer(function()
+            if INST.alive and d.Parent then
+                tryFire(d)
+            end
+        end)
+    end
+end))
+
 -- ---------- 主循环 ----------
 task.spawn(function()
     while INST.alive do
@@ -136,29 +172,27 @@ task.spawn(function()
                 setStatus("全部关闭")
                 return
             end
-            local moneyF, boxF, cleanF = 0, 0, 0
-            for _, d in ipairs(game.Workspace.Map:GetDescendants()) do
+            -- 全图扫描(带节点上限防卡死)
+            local scanned = 0
+            local fired = 0
+            for _, d in ipairs(game.Workspace:GetDescendants()) do
+                scanned = scanned + 1
+                if scanned > 30000 then break end -- 防卡死保险
                 if not INST.alive then return end
-                if d.ClassName == "ProximityPrompt" and d.Enabled then
-                    local act = d.ActionText
-                    if act and act ~= "" then
-                        for _, rule in ipairs(RULES) do
-                            if state[rule.key] and act:find(rule.pat) then
-                                pcall(function() fireproximityprompt(d) end)
-                                if rule.key == "money" then moneyF = moneyF + 1
-                                elseif rule.key == "boxes" then boxF = boxF + 1
-                                else cleanF = cleanF + 1 end
-                                task.wait(0.1)
-                                break
-                            end
-                        end
+                if d.ClassName == "ProximityPrompt" then
+                    local key = matchRule(d)
+                    if key and d.Enabled then
+                        pcall(function() fireproximityprompt(d) end)
+                        fired = fired + 1
+                        task.wait(0.08)
                     end
                 end
             end
-            if moneyF + boxF + cleanF > 0 then
-                setStatus(string.format("触发: 收钱%d 箱子%d 清理%d", moneyF, boxF, cleanF))
+            local cM, cB, cC = INST.cMoney or 0, INST.cBoxes or 0, INST.cClean or 0
+            if fired > 0 then
+                setStatus(string.format("全图触发%d个 | 累计: 钱%d 箱%d 清%d", fired, cM, cB, cC))
             else
-                setStatus("营地暂无可触发交互(等访客消费/帐篷变脏)")
+                setStatus(string.format("全图无匹配 | 累计: 钱%d 箱%d 清%d", cM, cB, cC))
             end
         end)
         if not ok then
