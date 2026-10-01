@@ -304,13 +304,14 @@ task.spawn(function()
                 gDist = flat.Magnitude
                 if hunted then danger = true; dangerWhy = "追杀" end
                 if state.avoid and not danger and gDist < state.dangerRange then
-                    -- 园丁朝向(优先Head)
+                    -- 园丁朝向(自定义骨架用Root部件)
                     local gLook
-                    local head = gardener:FindFirstChild("Head", true)
-                    if head and head:IsA("BasePart") then
-                        gLook = head.CFrame.LookVector
+                    local rootP = gardener:FindFirstChild("Root")
+                    if rootP and rootP:IsA("BasePart") then
+                        gLook = rootP.CFrame.LookVector
                     else
-                        gLook = gardener:GetPivot().LookVector
+                        local head = gardener:FindFirstChild("Head", true)
+                        gLook = head and head:IsA("BasePart") and head.CFrame.LookVector or gardener:GetPivot().LookVector
                     end
                     local gLookFlat = Vector3.new(gLook.X, 0, gLook.Z)
                     if gLookFlat.Magnitude > 0.01 then
@@ -322,14 +323,32 @@ task.spawn(function()
                             dangerWhy = string.format("视锥内(距%.0f)", gDist)
                         end
                     end
-                    -- 视线遮挡: 架子/墙挡住 = 安全
+                    -- 视线遮挡: 架子/墙挡住=安全, 玻璃穿透(温室屋顶是透明玻璃)
                     if danger and state.losCheck then
                         local params = RaycastParams.new()
                         params.FilterType = Enum.RaycastFilterType.Exclude
-                        params.FilterDescendantsInstances = {gardener, char}
+                        local excl = {gardener, char}
+                        local roof = game.Workspace.Greenhouse and game.Workspace.Greenhouse:FindFirstChild("Roof")
+                        if roof then table.insert(excl, roof) end
+                        params.FilterDescendantsInstances = excl
                         local eye = gp + Vector3.new(0, 2, 0)
-                        local hit = workspace:Raycast(eye, potPos - eye, params)
-                        if hit then
+                        local dirV = potPos - eye
+                        local blocked = false
+                        for _ = 1, 5 do
+                            if dirV.Magnitude <= 0.1 then break end
+                            local hit = workspace:Raycast(eye, dirV, params)
+                            if not hit then break end
+                            if hit.Instance.Transparency > 0.4 then
+                                -- 玻璃: 穿过去继续
+                                local used = (hit.Position - eye).Magnitude
+                                eye = hit.Position + dirV.Unit * 0.1
+                                dirV = dirV.Unit * (dirV.Magnitude - used - 0.1)
+                            else
+                                blocked = true
+                                break
+                            end
+                        end
+                        if blocked then
                             danger = false
                             dangerWhy = ""
                         end
