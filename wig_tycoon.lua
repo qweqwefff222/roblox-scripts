@@ -1,5 +1,5 @@
 --[[
-    剃头卖假发大亨 · 自动助手 v1.2 极速版
+    剃头卖假发大亨 · 自动助手 v1.3 零等待+升级版
     ============ 协议(实测) ============
     - 收集: RequestItemCollect:InvokeServer(rarity, false) → "match"=成功
       ✅ 无距离校验, 全图任意位置隔空收集(实测73米+)
@@ -31,12 +31,13 @@ local function bind(c) table.insert(INST.conns, c) end
 
 -- ================= 配置 =================
 local state = {
-    collect = true,   -- 自动收集假发(极限速度)
+    collect = true,   -- 自动收集假发(零等待极限速度)
     shelf = true,     -- 自动上架(Stock Shelf)
     cash = true,      -- 自动收钱(Collect Cash, 隔空)
     roll = true,      -- 自动免费抽奖
     buy = true,       -- 自动买建筑(只买现金, 跳过宝石)
     fix = true,       -- 自动修理
+    upgrade = true,   -- 自动升级机器
 }
 -- ========================================
 
@@ -73,7 +74,7 @@ gui.ResetOnSpawn = false
 gui.Parent = lp:WaitForChild("PlayerGui")
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.new(0, 200, 0, 248)
+frame.Size = UDim2.new(0, 200, 0, 278)
 frame.Position = UDim2.new(0, 20, 0, 140)
 frame.BackgroundColor3 = Color3.fromRGB(24, 26, 32)
 frame.BorderSizePixel = 0
@@ -143,9 +144,13 @@ makeToggle("自动修理机器", 178, function() return state.fix end, function(
     state.fix = v
 end)
 
+makeToggle("自动升级机器", 208, function() return state.upgrade end, function(v)
+    state.upgrade = v
+end)
+
 status = Instance.new("TextLabel")
 status.Size = UDim2.new(1, -16, 0, 42)
-status.Position = UDim2.new(0, 8, 0, 208)
+status.Position = UDim2.new(0, 8, 0, 238)
 status.BackgroundTransparency = 1
 status.Text = "状态: 等待..."
 status.TextColor3 = Color3.fromRGB(150, 200, 150)
@@ -178,9 +183,9 @@ task.spawn(function()
                 collectRate = cycleGot / dt
             end
             if cycleGot == 0 then
-                task.wait(0.4)
+                task.wait(0.25)
             else
-                task.wait(0.03)
+                task.wait() -- 零等待, 背靠背极限速度(物理上限=RTT)
             end
         else
             task.wait(0.5)
@@ -197,34 +202,51 @@ local function findMyTycoon()
     return nil
 end
 
-local function firePrompts()
-    local shelfN, cashN = 0, 0
+-- 提示缓存: 20秒重建一次(全树扫描很贵, tycoon有上千实例)
+local promptCache = {}
+local promptCacheAt = 0
+local function refreshPromptCache()
+    promptCache = {}
     local myTy = findMyTycoon()
     if myTy then
-        local containers = {}
-        local pur = myTy:FindFirstChild("Purchaseables")
-        if pur then table.insert(containers, pur) end
-        local st = myTy:FindFirstChild("Static")
-        if st then table.insert(containers, st) end
-        for _, container in ipairs(containers) do
-            for _, d in ipairs(container:GetDescendants()) do
-                if not INST.alive then break end
-                if d:IsA("ProximityPrompt") and d.Enabled then
-                    local act = d.ActionText
-                    if state.shelf and act == "Stock Shelf" then
-                        pcall(function() fireproximityprompt(d) end)
-                        shelfN = shelfN + 1
-                        task.wait(0.1)
-                    elseif state.cash and act == "Collect Cash" then
-                        pcall(function() fireproximityprompt(d) end)
-                        cashN = cashN + 1
-                        task.wait(0.1)
-                    end
-                end
+        for _, d in ipairs(myTy:GetDescendants()) do
+            if d:IsA("ProximityPrompt") then
+                table.insert(promptCache, d)
             end
         end
     end
-    return shelfN, cashN
+    promptCacheAt = os.clock()
+end
+
+-- 遍历缓存(便宜: 只读属性, 不扫树)
+local function firePrompts()
+    if os.clock() - promptCacheAt > 20 then
+        refreshPromptCache()
+    end
+    local shelfN, cashN, buyN, upN, fixN = 0, 0, 0, 0, 0
+    for _, d in ipairs(promptCache) do
+        if not INST.alive then break end
+        if d.Parent and d.Enabled then
+            local act = d.ActionText or ""
+            local hit = false
+            if state.shelf and act == "Stock Shelf" then
+                shelfN = shelfN + 1; hit = true
+            elseif state.cash and act == "Collect Cash" then
+                cashN = cashN + 1; hit = true
+            elseif state.buy and act:match("^Buy: %$%d") then
+                buyN = buyN + 1; hit = true
+            elseif state.upgrade and act:match("^Upgrade") then
+                upN = upN + 1; hit = true
+            elseif state.fix and act == "Fix" then
+                fixN = fixN + 1; hit = true
+            end
+            if hit then
+                pcall(function() fireproximityprompt(d) end)
+                task.wait(0.12)
+            end
+        end
+    end
+    return shelfN, cashN, buyN, upN, fixN
 end
 
 -- ---------- 抽奖 ----------
@@ -236,42 +258,12 @@ task.spawn(function()
     while INST.alive do
         local ok, err = pcall(function()
             local now = os.clock()
-            -- 上架+收钱
-            if (state.shelf or state.cash) and now - (INST.lastSell or 0) >= 1.0 then
+            -- 全部提示处理(上架/收钱/买建筑/升级/修理, 用缓存不扫树)
+            if now - (INST.lastSell or 0) >= 0.8 then
                 INST.lastSell = now
-                local sn, cn = firePrompts()
-                if sn + cn > 0 then
-                    log(string.format("上架%d 收钱%d", sn, cn))
-                end
-            end
-            -- 买建筑(只买$现金) + 修理
-            if (state.buy or state.fix) and now - (INST.lastBuy or 0) >= 1.5 then
-                INST.lastBuy = now
-                local bought, fixed = 0, 0
-                local myTy
-                for _, t in ipairs(game.Workspace.TycoonSystem.Tycoons:GetChildren()) do
-                    local o = t:FindFirstChild("Data") and t.Data:FindFirstChild("Owner")
-                    if o and o.Value == lp then myTy = t break end
-                end
-                if myTy then
-                    for _, d in ipairs(myTy:GetDescendants()) do
-                        if not INST.alive then break end
-                        if d:IsA("ProximityPrompt") and d.Enabled then
-                            local act = d.ActionText or ""
-                            if state.buy and act:match("^Buy: %$%d") then
-                                pcall(function() fireproximityprompt(d) end)
-                                bought = bought + 1
-                                task.wait(0.3)
-                            elseif state.fix and act == "Fix" then
-                                pcall(function() fireproximityprompt(d) end)
-                                fixed = fixed + 1
-                                task.wait(0.3)
-                            end
-                        end
-                    end
-                end
-                if bought + fixed > 0 then
-                    log(string.format("买建筑%d 修理%d", bought, fixed))
+                local sn, cn, bn, un, fn = firePrompts()
+                if sn + cn + bn + un + fn > 0 then
+                    log(string.format("上架%d 收钱%d 买%d 升级%d 修%d", sn, cn, bn, un, fn))
                 end
             end
             -- 抽奖
