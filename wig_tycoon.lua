@@ -162,13 +162,40 @@ status.TextWrapped = true
 status.Parent = frame
 
 -- ---------- 收集(极限速度专职线程) ----------
+-- 协议: 每次InvokeServer收1件, 单次0.21s(RTT) → 理论上限4.8件/秒
+-- 优化: 每轮先统计场上实际有货的稀有度, 按数量从多到少收, 不在空稀有度上浪费往返
 local collected = 0
 local collectRate = 0
+local CS = game:GetService("CollectionService")
 task.spawn(function()
     while INST.alive do
         if state.collect then
+            local now = os.clock()
+            -- 每3秒刷新一次"有货稀有度"列表(全表扫描太贵, 不能每轮做)
+            if now - (INST.rarityScanAt or 0) > 3 then
+                INST.rarityScanAt = now
+                local counts = {0, 0, 0, 0, 0, 0}
+                for _, it in ipairs(CS:GetTagged("Collectible")) do
+                    local rv = it:FindFirstChild("Rarity")
+                    local n = rv and tonumber(rv.Value)
+                    if n and n >= 1 and n <= 6 then
+                        counts[n] = counts[n] + 1
+                    end
+                end
+                local order = {}
+                for r = 1, 6 do
+                    if counts[r] > 0 then
+                        table.insert(order, r)
+                    end
+                end
+                table.sort(order, function(a, b) return counts[a] > counts[b] end)
+                if #order > 0 then
+                    INST.activeRarities = order
+                end
+            end
+            local order = INST.activeRarities or {1, 2, 3, 4, 5, 6}
             local cycleGot, t0 = 0, os.clock()
-            for r = 1, 6 do
+            for _, r in ipairs(order) do
                 if not INST.alive then break end
                 local ok, res = pcall(function()
                     return CollectRemote:InvokeServer(r, false)
@@ -179,13 +206,13 @@ task.spawn(function()
                 end
             end
             local dt = os.clock() - t0
-            if dt > 0.3 then
+            if dt > 0.15 then
                 collectRate = cycleGot / dt
             end
             if cycleGot == 0 then
-                task.wait(0.25)
+                task.wait(0.3) -- 可能场上没货了, 稍等
             else
-                task.wait() -- 零等待, 背靠背极限速度(物理上限=RTT)
+                task.wait() -- 零等待背靠背
             end
         else
             task.wait(0.5)
