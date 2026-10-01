@@ -1,5 +1,5 @@
 --[[
-    完成这个词 · 自动答题 v1.1
+    完成这个词 · 自动答题 v1.2 拟人版
     ============ 协议(反编译确认) ============
     - 上行: RemoteFunction:InvokeServer("keyStroke", 键名) 逐键(A-Z) + ("tryAnswer") 提交
     - 光标起始 = #RequiredLetter (前缀预填, 只发后缀!)
@@ -35,6 +35,10 @@ local state = {
     fixedDelay = 2.0,    -- 固定延迟值
     rMin = 1.0,          -- 随机下限
     rMax = 3.0,          -- 随机上限
+    humanType = true,    -- 拟人打字(错按修正+变速)
+    keyMin = 0.10,       -- 键入间隔下限
+    keyMax = 0.28,       -- 键入间隔上限
+    typoChance = 0.12,   -- 每词错按概率
 }
 -- ========================================
 
@@ -175,7 +179,7 @@ gui.ResetOnSpawn = false
 gui.Parent = lp:WaitForChild("PlayerGui")
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.new(0, 200, 0, 262)
+frame.Size = UDim2.new(0, 200, 0, 356)
 frame.Position = UDim2.new(0, 20, 0, 140)
 frame.BackgroundColor3 = Color3.fromRGB(24, 26, 32)
 frame.BorderSizePixel = 0
@@ -304,9 +308,21 @@ makeSlider(184, "随机上限: %.1f 秒", 1, 8, state.rMax, 0.5, function(v)
     state.rMax = v
 end)
 
+makeToggle("拟人打字(错按修正)", 216, function() return state.humanType end, function(v)
+    state.humanType = v
+end)
+
+makeSlider(246, "键入间隔下限: %.2f秒", 0.05, 0.4, state.keyMin, 0.01, function(v)
+    state.keyMin = v
+end)
+
+makeSlider(278, "键入间隔上限: %.2f秒", 0.1, 0.8, state.keyMax, 0.02, function(v)
+    state.keyMax = v
+end)
+
 status = Instance.new("TextLabel")
 status.Size = UDim2.new(1, -16, 0, 56)
-status.Position = UDim2.new(0, 8, 0, 218)
+status.Position = UDim2.new(0, 8, 0, 312)
 status.BackgroundTransparency = 1
 status.Text = "状态: 等待对局..."
 status.TextColor3 = Color3.fromRGB(150, 200, 150)
@@ -356,12 +372,44 @@ local function pickWord(req)
     return candidates[math.random(1, #candidates)]
 end
 
+-- QWERTY邻键(错按时选相邻键, 更像手滑)
+local NEIGHBOR = {
+    Q={"W","A"}, W={"Q","E","A","S"}, E={"W","R","S","D"}, R={"E","T","D","F"},
+    T={"R","Y","F","G"}, Y={"T","U","G","H"}, U={"Y","I","H","J"}, I={"U","O","J","K"},
+    O={"I","P","K","L"}, P={"O","L"}, A={"Q","W","S","Z"}, S={"A","W","E","D","X","Z"},
+    D={"S","E","R","F","C","X"}, F={"D","R","T","G","V","C"}, G={"F","T","Y","H","B","V"},
+    H={"G","Y","U","J","B","N"}, J={"H","U","I","K","N","M"}, K={"J","I","O","L","M"},
+    L={"K","O","P"}, Z={"A","S","X"}, X={"Z","S","D","C"}, C={"X","D","F","V"},
+    V={"C","F","G","B"}, B={"V","G","H","N"}, N={"B","H","J","M"}, M={"N","J","K"},
+}
+
+local function humanPause(lo, hi)
+    task.wait(lo + math.random() * (hi - lo))
+end
+
+-- 拟人逐键: 随机间隔 + 偶尔错按→停顿→退格→改对 + 偶尔思考停顿
 local function typeSuffix(suffix)
     for i = 1, #suffix do
         if not INST.alive then return end
         local ch = suffix:sub(i, i):upper()
+        -- 错按模拟: 概率触发(不打第一个键, 不连错)
+        if state.humanType and i > 1 and math.random() < state.typoChance then
+            local nb = NEIGHBOR[ch]
+            if nb then
+                local wrong = nb[math.random(1, #nb)]
+                RemoteFunction:InvokeServer("keyStroke", wrong)
+                humanPause(0.35, 0.85) -- 发现打错
+                RemoteFunction:InvokeServer("keyStroke", -1) -- 退格
+                humanPause(0.15, 0.35)
+            end
+        end
         RemoteFunction:InvokeServer("keyStroke", ch)
-        task.wait(0.06 + math.random() * 0.09)
+        -- 键入间隔: 随机上下限
+        task.wait(state.keyMin + math.random() * (state.keyMax - state.keyMin))
+        -- 偶尔中途思考停顿
+        if state.humanType and math.random() < 0.07 then
+            humanPause(0.3, 0.8)
+        end
     end
 end
 
@@ -463,8 +511,8 @@ task.spawn(function()
     end
 end)
 
-log(string.format("[WordChain v1.1] 加载 | 词库%d词", wordCount))
-print("[WordChain v1.1] 自动答题已加载 | 单例守护")
+log(string.format("[WordChain v1.2] 加载 | 词库%d词", wordCount))
+print("[WordChain v1.2] 自动答题已加载 | 单例守护")
 
 -- ---------- kill ----------
 INST.kill = function()
