@@ -1,22 +1,19 @@
 --[[
-    完成这个词 · 自动答题 v1.0
+    完成这个词 · 自动答题 v1.1
     ============ 协议(反编译确认) ============
-    - 上行: event.remoteFire("keyStroke", 键名) 逐键(A-Z) + ("tryAnswer") 提交
-      → 实际走 RemoteFunction:InvokeServer(name, ...)
-    - 下行: updateRound(轮数据, ?, 回合玩家) — 轮数据.RequiredLetter=必填开头字母串
-      → 输入光标起始位 = #RequiredLetter (前缀已预填, 只需打后缀!)
-    - correct/takeDamage 事件标记对错
+    - 上行: RemoteFunction:InvokeServer("keyStroke", 键名) 逐键(A-Z) + ("tryAnswer") 提交
+    - 光标起始 = #RequiredLetter (前缀预填, 只发后缀!)
+    - 下行: updateRound(轮数据{Choices,RequiredLetter}, ?, 回合玩家) 走4通道之一
     ============ 功能 ============
-    [自动答题] 监听 updateRound, 轮到自己时:
-      1. 延迟(基础+随机) 模拟思考
-      2. 从内嵌词库选一个以 RequiredLetter 开头、没用过的词
-      3. 逐键发送后缀(humanlike键间隔) → tryAnswer
-    [已答词追踪] 防重复
+    [自动答题] 监听 updateRound, 轮到自己 → 延迟(照搬数字塔: 固定/随机双开关+二选一)
+               → 选词(运行时拉取1万词表+内嵌基础词库, 防重复) → 逐键后缀(拟人) → 提交
+    [防重复]   自己发过的 + correct事件里的词 + 聊天单词条 + 答错的词拉黑
     单例守护 + 落盘日志
 ]]
 
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
+local TextChatService = game:GetService("TextChatService")
 
 local lp = Players.LocalPlayer
 local ev = game.ReplicatedStorage:WaitForChild("Services"):WaitForChild("Communication"):WaitForChild("event")
@@ -26,15 +23,18 @@ local RemoteFunction = ev:WaitForChild("RemoteFunction")
 if getgenv()._WC_INST and typeof(getgenv()._WC_INST.kill) == "function" then
     pcall(function() getgenv()._WC_INST.kill() end)
 end
-local INST = { alive = true, conns = {}, used = {} }
+local INST = { alive = true, conns = {}, used = {}, bad = {} }
 getgenv()._WC_INST = INST
 local function bind(c) table.insert(INST.conns, c) end
 
--- ================= 配置 =================
+-- ================= 配置(延迟系统照搬数字塔) =================
 local state = {
-    enabled = true,   -- 自动答题
-    baseDelay = 1.5,  -- 基础延迟(秒)
-    randDelay = 1.5,  -- 随机延迟上限(秒)
+    enabled = true,      -- 自动答题
+    fixedOn = true,      -- 固定延迟开关
+    randomOn = false,    -- 随机延迟开关
+    fixedDelay = 2.0,    -- 固定延迟值
+    rMin = 1.0,          -- 随机下限
+    rMax = 3.0,          -- 随机上限
 }
 -- ========================================
 
@@ -61,7 +61,26 @@ local function log(msg)
     end)
 end
 
--- ---------- 词库(常用英文词, 按首字母) ----------
+-- ---------- 延迟(照搬数字塔) ----------
+local function randomDelay()
+    local lo = math.min(state.rMin, state.rMax)
+    local hi = math.max(state.rMin, state.rMax)
+    return math.floor((lo + math.random() * (hi - lo)) * 10 + 0.5) / 10
+end
+
+local function pickDelay()
+    if state.fixedOn and state.randomOn then
+        if math.random() < 0.5 then return state.fixedDelay, "固定" end
+        return randomDelay(), "随机"
+    elseif state.fixedOn then
+        return state.fixedDelay, "固定"
+    elseif state.randomOn then
+        return randomDelay(), "随机"
+    end
+    return 0, "立即"
+end
+
+-- ---------- 词库 ----------
 local RAW = {
 A = "able about above add afraid after afternoon again age agree air airplane airport all allow almost alone along already also always amazing among angry animal ankle answer ant any anyone anything apartment appear apple apply approach April are area arm army around arrange arrive art artist as ask asleep assistant at attack attempt attend attention august aunt author autumn available average awake away",
 B = "baby back bad bag ball balloon banana band bank bar basket battle beach bear beat beautiful because become bed bee beef before begin behave behind believe bell belong below belt bench bend best better between beyond big bike bill bird birthday bit bite black blade blame blank blanket bless blind block blood blow blue board boat body boil bomb bone book boot border borrow boss both bottle bottom bowl box boy brain branch brave bread break breakfast breath brick bridge bright bring broad brother brown brush build bullet bundle burn burst business busy butter button buy",
@@ -91,15 +110,60 @@ Y = "yard yarn yell yellow yes yesterday yet yield you young your",
 Z = "zero zone zoo zipper",
 }
 
--- 解析词库
+-- 词桶
 local WORDS = {}
-for letter, str in pairs(RAW) do
-    local list = {}
-    for w in str:gmatch("%S+") do
-        table.insert(list, w)
+local wordCount = 0
+local function addWord(w)
+    w = w:lower()
+    if #w < 3 or #w > 12 then return end
+    if not w:match("^%a+$") then return end
+    local letter = w:sub(1, 1):upper()
+    local bucket = WORDS[letter]
+    if not bucket then
+        bucket = {}
+        WORDS[letter] = bucket
     end
-    WORDS[letter] = list
+    if not bucket[w] then
+        bucket[w] = true
+        wordCount = wordCount + 1
+    end
 end
+
+for letter, str in pairs(RAW) do
+    for w in str:gmatch("%S+") do
+        addWord(w)
+    end
+end
+
+-- 运行时拉取万词表(HttpGet, 本地缓存兜底)
+task.spawn(function()
+    local ok, body = pcall(function()
+        return game:HttpGet("https://raw.githubusercontent.com/first20hours/google-10000-english/master/google-10000-english-no-swears.txt")
+    end)
+    if ok and body and #body > 1000 then
+        local added = 0
+        for w in body:gmatch("%S+") do
+            local before = wordCount
+            addWord(w)
+            if wordCount > before then added = added + 1 end
+        end
+        INST.wordsReady = true
+        log(string.format("万词表加载成功, 新增%d词, 词库总数%d", added, wordCount))
+        pcall(function()
+            if writefile then writefile("wordchain_words.txt", body) end
+        end)
+    else
+        if isfile and isfile("wordchain_words.txt") then
+            local cached = readfile("wordchain_words.txt")
+            for w in cached:gmatch("%S+") do addWord(w) end
+            INST.wordsReady = true
+            log("万词表Http失败, 用本地缓存, 词库总数" .. wordCount)
+        else
+            INST.wordsReady = true
+            log("万词表拉取失败, 仅用内嵌词库, 词库总数" .. wordCount)
+        end
+    end
+end)
 
 -- ---------- 面板 ----------
 if lp.PlayerGui:FindFirstChild("_wc_panel") then
@@ -111,7 +175,7 @@ gui.ResetOnSpawn = false
 gui.Parent = lp:WaitForChild("PlayerGui")
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.new(0, 200, 0, 196)
+frame.Size = UDim2.new(0, 200, 0, 262)
 frame.Position = UDim2.new(0, 20, 0, 140)
 frame.BackgroundColor3 = Color3.fromRGB(24, 26, 32)
 frame.BorderSizePixel = 0
@@ -220,17 +284,29 @@ makeToggle("自动答题", 28, function() return state.enabled end, function(v)
     state.enabled = v
 end)
 
-makeSlider(58, "基础延迟: %.1f秒", 0.5, 5, state.baseDelay, 0.5, function(v)
-    state.baseDelay = v
+makeToggle("固定延迟", 58, function() return state.fixedOn end, function(v)
+    state.fixedOn = v
 end)
 
-makeSlider(90, "随机延迟: %.1f秒", 0, 4, state.randDelay, 0.5, function(v)
-    state.randDelay = v
+makeToggle("随机延迟", 88, function() return state.randomOn end, function(v)
+    state.randomOn = v
+end)
+
+makeSlider(120, "固定延迟: %.1f 秒", 1, 5, state.fixedDelay, 0.5, function(v)
+    state.fixedDelay = v
+end)
+
+makeSlider(152, "随机下限: %.1f 秒", 1, 5, state.rMin, 0.5, function(v)
+    state.rMin = v
+end)
+
+makeSlider(184, "随机上限: %.1f 秒", 1, 8, state.rMax, 0.5, function(v)
+    state.rMax = v
 end)
 
 status = Instance.new("TextLabel")
-status.Size = UDim2.new(1, -16, 0, 60)
-status.Position = UDim2.new(0, 8, 0, 122)
+status.Size = UDim2.new(1, -16, 0, 56)
+status.Position = UDim2.new(0, 8, 0, 218)
 status.BackgroundTransparency = 1
 status.Text = "状态: 等待对局..."
 status.TextColor3 = Color3.fromRGB(150, 200, 150)
@@ -241,14 +317,38 @@ status.TextYAlignment = Enum.TextYAlignment.Top
 status.TextWrapped = true
 status.Parent = frame
 
+-- ---------- 防重复 ----------
+local function markUsed(w)
+    INST.used[w:lower()] = true
+end
+
+local function isUsed(w)
+    return INST.used[w:lower()] or INST.bad[w:lower()]
+end
+
+-- 聊天单词条记录
+pcall(function()
+    local general = TextChatService.TextChannels:FindFirstChild("RBXGeneral")
+    if general then
+        bind(general.MessageReceived:Connect(function(msg)
+            if msg.Status == Enum.TextChatMessageStatus.Success then
+                local t = msg.Text or ""
+                if t:match("^%a+$") and #t >= 3 then
+                    markUsed(t)
+                end
+            end
+        end))
+    end
+end)
+
 -- ---------- 答题逻辑 ----------
 local function pickWord(req)
     local letter = req:sub(1, 1):upper()
-    local list = WORDS[letter]
-    if not list then return nil end
+    local bucket = WORDS[letter]
+    if not bucket then return nil end
     local candidates = {}
-    for _, w in ipairs(list) do
-        if #w > #req and w:sub(1, #req):lower() == req:lower() and not INST.used[w] then
+    for w in pairs(bucket) do
+        if #w > #req and w:sub(1, #req):lower() == req:lower() and not isUsed(w) then
             table.insert(candidates, w)
         end
     end
@@ -266,18 +366,6 @@ local function typeSuffix(suffix)
 end
 
 -- 监听4条入站通道
-local function fmtv(v, depth)
-    if type(v) == "table" then
-        if depth > 1 then return "{...}" end
-        local parts = {}
-        for k, vv in pairs(v) do
-            parts[#parts + 1] = tostring(k) .. "=" .. fmtv(vv, depth + 1)
-        end
-        return "{" .. table.concat(parts, ","):sub(1, 200) .. "}"
-    end
-    return tostring(v):sub(1, 80)
-end
-
 local handlers = {ev.RemoteEvent, ev.UnreliableRemoteEvent, ev.FastRe, ev.FastUre}
 for _, r in ipairs(handlers) do
     bind(r.OnClientEvent:Connect(function(...)
@@ -292,11 +380,24 @@ for _, r in ipairs(handlers) do
                 log(string.format("updateRound: req=%s turn=%s", tostring(round.RequiredLetter), tostring(turnPlayer)))
             end
         elseif name == "correct" then
-            -- 记录别人答对的词(防重复)
-            local w = args[2] or args[3]
-            if type(w) == "string" and #w > 1 then
-                INST.used[w:lower()] = true
-                log("correct: " .. w)
+            for i = 2, #args do
+                local v = args[i]
+                if type(v) == "string" and v:match("^%a+$") and #v >= 3 then
+                    markUsed(v)
+                    log("correct记词: " .. v)
+                elseif type(v) == "table" then
+                    for _, vv in pairs(v) do
+                        if type(vv) == "string" and vv:match("^%a+$") and #vv >= 3 then
+                            markUsed(vv)
+                        end
+                    end
+                end
+            end
+        elseif name == "takeDamage" then
+            if INST.lastSent then
+                INST.bad[INST.lastSent] = true
+                log("答错拉黑: " .. INST.lastSent)
+                INST.lastSent = nil
             end
         end
     end))
@@ -307,22 +408,22 @@ task.spawn(function()
     while INST.alive do
         local ok, err = pcall(function()
             if not state.enabled then
-                setStatus("自动答题已关")
+                setStatus("自动答题已关 | 词库" .. wordCount .. "词")
                 return
             end
             if not lp:GetAttribute("InGame") then
-                setStatus("不在对局中")
+                setStatus("不在对局中 | 词库" .. wordCount .. "词")
                 return
             end
             local round = INST.lastRound
             local turn = INST.turnPlayer
             if not round or not turn then
-                setStatus("等待对局数据...")
+                setStatus(string.format("等待对局数据... | 词库%d词", wordCount))
                 return
             end
             if turn ~= lp then
                 local tn = typeof(turn) == "Instance" and turn.Name or tostring(turn)
-                setStatus(string.format("等待别人答 (%s) | 已答%d词", tn, #INST.used and (function() local n=0 for _ in pairs(INST.used) do n=n+1 end return n end)() or 0))
+                setStatus(string.format("等待 %s 作答 | 词库%d词", tn, wordCount))
                 return
             end
             local req = tostring(round.RequiredLetter or "")
@@ -330,27 +431,29 @@ task.spawn(function()
                 setStatus("本轮无必填字母?")
                 return
             end
-            -- 我的回合: 延迟+随机延迟
-            local wait = state.baseDelay + math.random() * state.randDelay
-            setStatus(string.format("轮到我! 必填'%s' | 思考%.1f秒...", req, wait))
-            task.wait(wait)
-            if not INST.alive then return end
+            -- 数字塔式延迟
+            local delay, tag = pickDelay()
+            setStatus(string.format("轮到我! 必填'%s' | %s延迟%.1fs...", req, tag, delay))
+            local t0 = os.clock()
+            while os.clock() - t0 < delay do
+                task.wait(0.1)
+                if not INST.alive then return end
+            end
             -- 选词
             local word = pickWord(req)
             if not word then
-                setStatus(string.format("词库里 '%s' 开头的词都用完了!", req))
+                setStatus(string.format("词库里 '%s' 开头的可用词用完了!", req))
                 task.wait(2)
                 return
             end
             local suffix = word:sub(#req + 1):upper()
             log(string.format("答题: req=%s word=%s suffix=%s", req, word, suffix))
-            -- 逐键发送后缀
+            INST.lastSent = word:lower()
             typeSuffix(suffix)
-            -- 提交
             RemoteFunction:InvokeServer("tryAnswer")
-            INST.used[word:lower()] = true
-            setStatus(string.format("已提交 '%s' (后缀%s, %d键)", word, suffix, #suffix))
-            INST.lastRound = nil -- 防重复答
+            markUsed(word)
+            setStatus(string.format("已提交 '%s' (%s延迟%.1fs)", word, tag, delay))
+            INST.lastRound = nil
         end)
         if not ok then
             log("主循环异常: " .. tostring(err))
@@ -360,8 +463,8 @@ task.spawn(function()
     end
 end)
 
-log("[WordChain v1.0] 自动答题已加载 | 单例守护")
-print("[WordChain v1.0] 自动答题已加载 | 单例守护")
+log(string.format("[WordChain v1.1] 加载 | 词库%d词", wordCount))
+print("[WordChain v1.1] 自动答题已加载 | 单例守护")
 
 -- ---------- kill ----------
 INST.kill = function()
