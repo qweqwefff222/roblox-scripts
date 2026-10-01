@@ -141,14 +141,15 @@ task.spawn(function()
                 local pos = ehrp.Position
                 hrp.CFrame = CFrame.new(hrp.Position, Vector3.new(pos.X, hrp.Position.Y, pos.Z))
             end
-            -- 按服务器冷却横扫
+            -- 极限连发: 不走客户端冷却, 0.12s/次; 服务器限速时自动降速
             local now = os.clock()
-            if now - lastSwing >= (Config.BatCooldown + 0.03) then
+            local gap = INST.throttle or 0.12
+            if now - lastSwing >= gap then
                 lastSwing = now
                 Action:FireServer("Primary")
                 swings = swings + 1
             end
-            setStatus(string.format("⚔ 攻击 %s (距%.0f) | 挥击x%d", enemy.Name, dist, swings))
+            setStatus(string.format("⚔ 攻击 %s (距%.0f) | x%d 速率1/%.2fs", enemy.Name, dist, swings, gap))
         end)
         if not ok then
             setStatus("异常: " .. tostring(err):sub(1, 40))
@@ -157,7 +158,14 @@ task.spawn(function()
     end
 end)
 
-print("[Kidnap v1.1] 杀戮光环已加载 | 单例守护")
+-- 服务器限速警告监听: 收到冷却/稍等类通知 → 节流翻倍(上限1.5s)
+bind(game.ReplicatedStorage.KidnapAndJail.Notice.OnClientEvent:Connect(function(msg)
+    if type(msg) == "string" and (msg:lower():find("cool") or msg:find("冷却") or msg:find("wait") or msg:find("稍候") or msg:find("稍等")) then
+        INST.throttle = math.min((INST.throttle or 0.12) * 2, 1.5)
+    end
+end))
+
+print("[Kidnap v1.2] 杀戮光环(极限连发+自动降速)已加载 | 单例守护")
 
 -- ---------- kill ----------
 INST.kill = function()
