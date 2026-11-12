@@ -49,6 +49,9 @@ local State = {
     ESPHealth = true,
     ESPTeamCheck = true,
     ESPMaxDist = 500,
+
+    -- 载具武器
+    VehicleAim = true,
 }
 
 getgenv().VF = State
@@ -251,21 +254,94 @@ local function installNamecall()
             local method = getnamecallmethod()
             if method == "FireServer" and State.SilentEnabled and typeof(self) == "Instance" then
                 local nm = self.Name
+
+                -- ① 步兵枪械: FireServer(origin, direction, serverTime)
                 if FIRE_NAMES[nm] then
                     local a1, a2, a3 = ...
-                    -- a1 = origin(Vector3), a2 = direction(Vector3), a3 = serverTime
                     if typeof(a1) == "Vector3" and typeof(a2) == "Vector3" then
                         local tp = cachedPos
                         if tp then
                             local d = tp - a1
                             if d.Magnitude > 1 then
                                 a2 = d.Unit
-                                State.LastRedirect = os.clock()
                                 State.RedirectCount = (State.RedirectCount or 0) + 1
                             end
                         end
                     end
                     return old(self, a1, a2, a3)
+                end
+
+                -- ② 直升机机炮/火箭: HeliFire:FireServer(id, "gun"|"rocket", 目标点, ...)
+                if nm == "HeliFire" and State.VehicleAim then
+                    local id, kind, pos, a4, a5 = ...
+                    local tp = cachedPos
+                    if tp and typeof(pos) == "Vector3" then
+                        local vehPos = nil
+                        pcall(function()
+                            local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+                            if hum and hum.SeatPart then
+                                vehPos = hum.SeatPart.Position
+                            end
+                        end)
+                        -- 火箭: 第3参数=目标点, 第4=起点, 第5=方向
+                        if kind == "rocket" and vehPos then
+                            local dir = (tp - vehPos).Unit
+                            State.RedirectCount = (State.RedirectCount or 0) + 1
+                            return old(self, id, kind, vehPos + dir * math.max((tp - vehPos).Magnitude, 60), vehPos, dir)
+                        end
+                        -- 机炮: 第3参数直接是命中点
+                        State.RedirectCount = (State.RedirectCount or 0) + 1
+                        return old(self, id, kind, tp, a4, a5)
+                    end
+                    return old(self, id, kind, pos, a4, a5)
+                end
+
+                -- ③ 坦克: TankFire:FireServer(id, yaw, pitch, [弹种]) — 角度换算
+                if nm == "TankFire" and State.VehicleAim then
+                    local id, yaw, pitch, kind = ...
+                    local tp = cachedPos
+                    if tp then
+                        pcall(function()
+                            local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+                            local seat = hum and hum.SeatPart
+                            if seat then
+                                local veh = seat.Parent
+                                local origin = veh and (veh:FindFirstChild("TurretBase") or veh.PrimaryPart)
+                                if origin then
+                                    local d = tp - origin.Position
+                                    local flat = Vector3.new(d.X, 0, d.Z)
+                                    local newYaw = math.deg(math.atan2(-d.X, -d.Z))
+                                    local newPitch = math.deg(math.atan2(d.Y, flat.Magnitude))
+                                    yaw = newYaw
+                                    pitch = newPitch
+                                    State.RedirectCount = (State.RedirectCount or 0) + 1
+                                end
+                            end
+                        end)
+                    end
+                    return old(self, id, yaw, pitch, kind)
+                end
+
+                -- ④ 直升机瞄准同步
+                if nm == "HeliGunAim" and State.VehicleAim then
+                    local id, yaw, pitch, spin = ...
+                    local tp = cachedPos
+                    if tp then
+                        pcall(function()
+                            local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+                            local seat = hum and hum.SeatPart
+                            if seat then
+                                local veh = seat.Parent
+                                if veh and veh.PrimaryPart then
+                                    local d = tp - veh.PrimaryPart.Position
+                                    local flat = Vector3.new(d.X, 0, d.Z)
+                                    yaw = math.deg(math.atan2(-d.X, -d.Z))
+                                    pitch = math.deg(math.atan2(d.Y, math.max(flat.Magnitude, 0.1)))
+                                end
+                            end
+                        end)
+                    end
+                    return old(self, id, yaw, pitch, spin)
                 end
             end
             return old(self, ...)
@@ -493,6 +569,12 @@ AimTab:Toggle({
     Value = false,
     Callback = function(s) State.ShowIndicator = s end,
 })
+AimTab:Toggle({
+    Title = "载具武器静默 (直升机/坦克)",
+    Value = true,
+    Callback = function(s) State.VehicleAim = s end,
+})
+
 AimTab:Dropdown({
     Title = "优先目标",
     Values = { "准星最近", "距离最近", "距离最远", "血量最低", "血量最高" },
