@@ -559,6 +559,14 @@ task.spawn(function()
     end
 end)
 
+-- Tab: 关于
+local AboutTab = Window:Tab({ Title = "关于", Icon = "user" })
+AboutTab:Section({ Title = "作者", Icon = "user-round" })
+AboutTab:Paragraph({
+    Title = "B站：英吉利超入_",
+    Desc = "脚本作者",
+})
+
 -- ============================================================
 -- 快捷键 + 悬浮按钮 (解决最小化后找不到窗口)
 --   RightShift  → 显示/隐藏窗口
@@ -636,14 +644,6 @@ UIS.InputBegan:Connect(function(input, gp)
         toggleWindow()
     elseif input.KeyCode == Enum.KeyCode.RightControl then
         State.SilentEnabled = not State.SilentEnabled
-        -- Tab: 关于
-local AboutTab = Window:Tab({ Title = "关于", Icon = "user" })
-AboutTab:Section({ Title = "作者", Icon = "user-round" })
-AboutTab:Paragraph({
-    Title = "B站：英吉利超入_",
-    Desc = "脚本作者",
-})
-
 WindUI:Notify({
             Title = "静默瞄准",
             Content = State.SilentEnabled and "已开启" or "已关闭",
