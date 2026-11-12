@@ -56,6 +56,12 @@ local State = {
     -- 下坠补偿 (默认关, 和步枪一致走直线)
     DropComp = false,
 
+    -- 暴怒机器人
+    RageBot = false,
+    RageFOV = 9999,          -- 无限 FOV (身后也打)
+    RageInterval = 0.05,     -- 开枪间隔
+    RageAutoReload = true,   -- 自动装弹
+
 
 }
 
@@ -743,6 +749,121 @@ RunService.RenderStepped:Connect(function()
 end)
 
 -- ============================================================
+-- 暴怒机器人 (Rage Bot)
+--   · 无 FOV 限制, 背后目标也打
+--   · 条件: 无建筑遮挡 (真实 Raycast)
+--   · 自动开枪 + 自动装弹
+-- ============================================================
+local RELOAD_MAP = {
+    AssaultRifle = "ReloadRifle", K433 = "ReloadRifle", BT762 = "ReloadRifle",
+    MX65 = "ReloadRifle", SK556 = "ReloadRifle", RN545 = "ReloadRifle", GX36 = "ReloadRifle",
+    SMG = "ReloadSMG", HM45 = "ReloadSMG", SP44 = "ReloadSMG", TK17 = "ReloadSMG",
+    PD46 = "ReloadSMG", KP50 = "ReloadSMG",
+    LMG = "ReloadLMG", MG60 = "ReloadLMG", HX83 = "ReloadLMG", BX110 = "ReloadLMG",
+    Sniper = "ReloadSniper", SC11 = "ReloadSniper", RX10 = "ReloadSniper",
+    DMR = "ReloadDMR", FS16 = "ReloadDMR", QS9 = "ReloadDMR", GV12 = "ReloadDMR", KR54 = "ReloadDMR",
+    Pistol = "ReloadPistol", ZK10 = "ReloadPistol", SV20 = "ReloadPistol",
+    Shotgun = "ReloadShotgun", HandCannon = "ReloadHandCannon", RocketLauncher = "ReloadRocket",
+}
+
+local function getTool()
+    local c = LP.Character
+    return c and c:FindFirstChildOfClass("Tool") or nil
+end
+
+local function rageVisible(fromPos, tp, tmodel)
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    rp.FilterDescendantsInstances = { LP.Character, tmodel }
+    rp.IgnoreWater = true
+    local dir = tp - fromPos
+    local dist = dir.Magnitude
+    if dist < 1 then return true end
+    local hit = Workspace:Raycast(fromPos, dir, rp)
+    if not hit then return true end
+    return hit.Distance >= dist - 1.5
+end
+
+local lastReloadT = 0
+local function tryReload()
+    local now = os.clock()
+    if now - lastReloadT < 1.5 then return end
+    local tool = getTool()
+    if not tool then return end
+    local rname = RELOAD_MAP[tool.Name]
+    if not rname then return end
+    pcall(function()
+        local vx = RS:FindFirstChild("Voxel")
+        local rem = vx and vx:FindFirstChild("Remotes")
+        local r = rem and rem:FindFirstChild(rname)
+        if r then
+            r:FireServer()
+            lastReloadT = now
+            State.ReloadCount = (State.ReloadCount or 0) + 1
+        end
+    end)
+end
+VF.TryReload = tryReload
+
+-- 20: 暴怒主循环
+task.spawn(function()
+    local lastShot = 0
+    local lastRageShot = 0
+    while true do
+        task.wait(0.02)
+        if State.RageBot then
+            local now = os.clock()
+            if now - lastShot >= (State.RageInterval or 0.05) then
+                local tool = getTool()
+                if tool then
+                    local best = nil
+                    local lst = orderedEnemies
+                    local camPos = Camera.CFrame.Position
+                    if lst then
+                        for i = 1, #lst do
+                            local it = lst[i]
+                            if it.part and it.part.Parent then
+                                if rageVisible(camPos, it.part.Position, it.model) then
+                                    best = it
+                                    break
+                                end
+                            end
+                        end
+                    end
+                    if best then
+                        cachedPos = best.part.Position
+                        cachedTargetPart = best.part
+                        State.rageTarget = best.model.Name
+                        pcall(function() tool:Activate() end)
+                        lastShot = now
+                        lastRageShot = now
+                        State.RageShots = (State.RageShots or 0) + 1
+                    else
+                        if State.RageAutoReload then pcall(tryReload) end
+                    end
+                end
+            end
+        end
+    end
+end)
+
+-- 21: 卡弹自动补 (连续 2 秒没开枪成功就装弹)
+task.spawn(function()
+    local lastCount = 0
+    while true do
+        task.wait(2)
+        if State.RageBot and State.RageAutoReload then
+            local cur = State.RageShots or 0
+            if cur == lastCount then
+                pcall(tryReload)
+            end
+            lastCount = cur
+        end
+    end
+end)
+
+
+-- ============================================================
 -- WindUI 界面
 -- ============================================================
 local Window = WindUI:CreateWindow({
@@ -789,6 +910,26 @@ AimTab:Toggle({
     Title = "载具武器静默 (直升机/坦克)",
     Value = true,
     Callback = function(s) State.VehicleAim = s end,
+})
+
+AimTab:Section({ Title = "暴怒机器人", Icon = "flame" })
+AimTab:Toggle({
+    Title = "暴怒机器人 (无FOV/自动开枪)",
+    Value = false,
+    Callback = function(s)
+        State.RageBot = s
+        if s then State.SilentEnabled = true end
+    end,
+})
+AimTab:Toggle({
+    Title = "自动装弹",
+    Value = true,
+    Callback = function(s) State.RageAutoReload = s end,
+})
+AimTab:Slider({
+    Title = "开枪间隔",
+    Value = { Min = 0.02, Max = 0.5, Default = 0.05, Decimals = 2 },
+    Callback = function(v) State.RageInterval = v end,
 })
 
 AimTab:Dropdown({
