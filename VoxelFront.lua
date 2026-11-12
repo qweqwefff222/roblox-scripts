@@ -135,6 +135,140 @@ end
 VF.GetEnemies = getEnemies
 
 -- ============================================================
+-- 预测系统 (自动检测, 玩家无需填任何数值)
+--
+-- 弹速: 读 Tracers.SPEED (游戏官方值, 当前 1000 studs/s)
+--       优先调 Tracers.travelTime() 拿精确飞行时间
+-- 敌速: 每帧采样每个敌人的位置, 自动算出移动速度和方向
+-- ============================================================
+State.PredictEnabled = true
+State.PredictMaxTime = 0.6      -- 最多预判 0.6 秒, 防止甩飞
+
+-- 弹速自动读取
+local bulletSpeed = 1000
+local travelTimeFn = nil
+pcall(function()
+    local vx = RS:FindFirstChild("Voxel")
+    local T = vx and vx:FindFirstChild("Tracers")
+    if T then
+        local ok, mod = pcall(require, T)
+        if ok and type(mod) == "table" then
+            if type(mod.SPEED) == "number" then bulletSpeed = mod.SPEED end
+            if type(mod.travelTime) == "function" then travelTimeFn = mod.travelTime end
+        end
+    end
+end)
+State.BulletSpeed = bulletSpeed
+print("[VF] 弹速自动检测: " .. tostring(bulletSpeed))
+
+-- 敌人速度追踪表
+local velTrack = {}   -- [model] = { pos, time, vel }
+
+-- 每帧采样敌人位置
+task.spawn(function()
+    while true do
+        task.wait(0.05)
+        if State.PredictEnabled then
+            local now = os.clock()
+            local alive = {}
+            for _, e in ipairs(getEnemies()) do
+                local m = e.model
+                alive[m] = true
+                local root = m:FindFirstChild("HumanoidRootPart") or e.part
+                if root then
+                    local rec = velTrack[m]
+                    if rec then
+                        local dt = now - rec.time
+                        if dt > 0.01 and dt < 0.5 then
+                            local v = (root.Position - rec.pos) / dt
+                            -- 平滑 + 过滤异常值 (瞬移/被击退)
+                            if v.Magnitude < 200 then
+                                rec.vel = rec.vel * 0.6 + v * 0.4
+                            else
+                                rec.vel = Vector3.new(0, 0, 0)
+                            end
+                        end
+                        rec.pos = root.Position
+                        rec.time = now
+                    else
+                        velTrack[m] = {
+                            pos = root.Position,
+                            time = now,
+                            vel = Vector3.new(0, 0, 0),
+                        }
+                    end
+                end
+            end
+            -- 清理消失的
+            for m in pairs(velTrack) do
+                if not alive[m] then velTrack[m] = nil end
+            end
+        end
+    end
+end)
+
+-- 预测目标位置
+local function predictPos(target)
+    if not target or not State.PredictEnabled then
+        return target and target.part and target.part.Position or nil
+    end
+    local m = target.model
+    local part = target.part
+    if not part then return nil end
+
+    -- 载具里用角色位置(相机在载具上会偏移), 步兵用相机
+    local origin = Camera.CFrame.Position
+    local char = LP.Character
+    if char then
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        if hrp and LP:GetAttribute("InVehicle") then
+            origin = hrp.Position
+        end
+    end
+
+    local dist = (part.Position - origin).Magnitude
+
+    -- 飞行时间: 优先官方函数, 否则 距离/弹速
+    local flight
+    if travelTimeFn then
+        local ok, t = pcall(travelTimeFn, origin, part.Position)
+        flight = (ok and type(t) == "number") and t or (dist / bulletSpeed)
+    else
+        flight = dist / bulletSpeed
+    end
+    flight = math.clamp(flight, 0, State.PredictMaxTime)
+
+    -- 敌人速度
+    local rec = velTrack[m]
+    local vel = rec and rec.vel or Vector3.new(0, 0, 0)
+
+    return part.Position + vel * flight
+end
+
+-- ============================================================
+-- 载具状态检测 (游戏用 LocalPlayer 的 InVehicle 属性, 不是原生 Seat)
+--   InVehicle = "air"    → 直升机/飞机
+--   InVehicle = "ground" → 坦克/车辆
+-- ============================================================
+local function getVehicleState()
+    local v = LP:GetAttribute("InVehicle")
+    return v  -- "air" | "ground" | nil
+end
+
+VF.GetVehicleState = getVehicleState
+VF.IsInVehicle = function() return getVehicleState() ~= nil end
+
+-- 载具类型
+VF.IsInAirVehicle = function() return getVehicleState() == "air" end
+VF.IsInGroundVehicle = function() return getVehicleState() == "ground" end
+
+VF.PredictPos = predictPos
+VF.GetVelocity = function(model)
+    local rec = velTrack[model]
+    return rec and rec.vel or Vector3.new(0, 0, 0)
+end
+
+-- ============================================================
 -- 选目标
 -- ============================================================
 local function visible(fromPos, toPos, ignoreModel)
@@ -188,7 +322,8 @@ end
 VF.PickTarget = pickTarget
 
 -- 目标缓存
-local cachedTarget, cachedPos = nil, nil
+local cachedTarget, cachedPos, predictedPos = nil, nil, nil
+local vehiclePos = nil
 task.spawn(function()
     while true do
         task.wait(0.04)
@@ -196,8 +331,27 @@ task.spawn(function()
             local ok, t = pcall(pickTarget)
             cachedTarget = ok and t or nil
             cachedPos = (ok and t) and t.part.Position or nil
+            -- 预计算预测位置 (在后台算, hook 里只读)
+            if ok and t then
+                local pok, pp = pcall(predictPos, t)
+                predictedPos = (pok and pp) or cachedPos
+            else
+                predictedPos = nil
+            end
             State.cachedTarget = cachedTarget
             State.cachedPos = cachedPos
+            State.predictedPos = predictedPos
+
+            -- 缓存载具位置 (供 hook 里做角度换算, 避免重入)
+            vehiclePos = nil
+            pcall(function()
+                local c = LP.Character
+                if not c then return end
+                local hrp = c:FindFirstChild("HumanoidRootPart")
+                if hrp and LP:GetAttribute("InVehicle") then
+                    vehiclePos = hrp.Position
+                end
+            end)
         else
             cachedTarget, cachedPos = nil, nil
             State.cachedTarget = nil
@@ -252,98 +406,79 @@ local function installNamecall()
         setreadonly(mt, false)
         mt.__namecall = newcclosure(function(self, ...)
             local method = getnamecallmethod()
-            if method == "FireServer" and State.SilentEnabled and typeof(self) == "Instance" then
-                local nm = self.Name
-
-                -- ① 步兵枪械: FireServer(origin, direction, serverTime)
-                if FIRE_NAMES[nm] then
-                    local a1, a2, a3 = ...
-                    if typeof(a1) == "Vector3" and typeof(a2) == "Vector3" then
-                        local tp = cachedPos
-                        if tp then
-                            local d = tp - a1
-                            if d.Magnitude > 1 then
-                                a2 = d.Unit
-                                State.RedirectCount = (State.RedirectCount or 0) + 1
-                            end
-                        end
-                    end
-                    return old(self, a1, a2, a3)
-                end
-
-                -- ② 直升机机炮/火箭: HeliFire:FireServer(id, "gun"|"rocket", 目标点, ...)
-                if nm == "HeliFire" and State.VehicleAim then
-                    local id, kind, pos, a4, a5 = ...
-                    local tp = cachedPos
-                    if tp and typeof(pos) == "Vector3" then
-                        local vehPos = nil
-                        pcall(function()
-                            local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
-                            if hum and hum.SeatPart then
-                                vehPos = hum.SeatPart.Position
-                            end
-                        end)
-                        -- 火箭: 第3参数=目标点, 第4=起点, 第5=方向
-                        if kind == "rocket" and vehPos then
-                            local dir = (tp - vehPos).Unit
-                            State.RedirectCount = (State.RedirectCount or 0) + 1
-                            return old(self, id, kind, vehPos + dir * math.max((tp - vehPos).Magnitude, 60), vehPos, dir)
-                        end
-                        -- 机炮: 第3参数直接是命中点
-                        State.RedirectCount = (State.RedirectCount or 0) + 1
-                        return old(self, id, kind, tp, a4, a5)
-                    end
-                    return old(self, id, kind, pos, a4, a5)
-                end
-
-                -- ③ 坦克: TankFire:FireServer(id, yaw, pitch, [弹种]) — 角度换算
-                if nm == "TankFire" and State.VehicleAim then
-                    local id, yaw, pitch, kind = ...
-                    local tp = cachedPos
-                    if tp then
-                        pcall(function()
-                            local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
-                            local seat = hum and hum.SeatPart
-                            if seat then
-                                local veh = seat.Parent
-                                local origin = veh and (veh:FindFirstChild("TurretBase") or veh.PrimaryPart)
-                                if origin then
-                                    local d = tp - origin.Position
-                                    local flat = Vector3.new(d.X, 0, d.Z)
-                                    local newYaw = math.deg(math.atan2(-d.X, -d.Z))
-                                    local newPitch = math.deg(math.atan2(d.Y, flat.Magnitude))
-                                    yaw = newYaw
-                                    pitch = newPitch
-                                    State.RedirectCount = (State.RedirectCount or 0) + 1
-                                end
-                            end
-                        end)
-                    end
-                    return old(self, id, yaw, pitch, kind)
-                end
-
-                -- ④ 直升机瞄准同步
-                if nm == "HeliGunAim" and State.VehicleAim then
-                    local id, yaw, pitch, spin = ...
-                    local tp = cachedPos
-                    if tp then
-                        pcall(function()
-                            local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
-                            local seat = hum and hum.SeatPart
-                            if seat then
-                                local veh = seat.Parent
-                                if veh and veh.PrimaryPart then
-                                    local d = tp - veh.PrimaryPart.Position
-                                    local flat = Vector3.new(d.X, 0, d.Z)
-                                    yaw = math.deg(math.atan2(-d.X, -d.Z))
-                                    pitch = math.deg(math.atan2(d.Y, math.max(flat.Magnitude, 0.1)))
-                                end
-                            end
-                        end)
-                    end
-                    return old(self, id, yaw, pitch, spin)
-                end
+            -- 只处理 FireServer, 其它一律原样透传 (零改动)
+            if method ~= "FireServer" then
+                return old(self, ...)
             end
+            if not State.SilentEnabled then
+                return old(self, ...)
+            end
+            if typeof(self) ~= "Instance" then
+                return old(self, ...)
+            end
+
+            local nm = self.Name
+            local args = table.pack(...)
+
+            -- ① 步兵枪械: (origin, direction, serverTime)
+            if FIRE_NAMES[nm] then
+                local a1, a2 = args[1], args[2]
+                if typeof(a1) == "Vector3" and typeof(a2) == "Vector3" then
+                    local tp = cachedPos
+                    if tp then
+                        local d = tp - a1
+                        if d.Magnitude > 1 then
+                            args[2] = d.Unit
+                            State.RedirectCount = (State.RedirectCount or 0) + 1
+                        end
+                    end
+                end
+                return old(self, table.unpack(args, 1, args.n))
+            end
+
+            -- ② 直升机机炮: (id, "gun", hitPos)  → 改第3参数
+            if nm == "HeliFire" and State.VehicleAim then
+                local aimPos = predictedPos or cachedPos
+                if aimPos and args[2] == "gun" and typeof(args[3]) == "Vector3" then
+                    args[3] = aimPos
+                    State.RedirectCount = (State.RedirectCount or 0) + 1
+                    State.LastVehicleRedirect = os.clock()
+                end
+                return old(self, table.unpack(args, 1, args.n))
+            end
+
+            -- ③ 坦克: (id, yaw, pitch, [弹种]) → 角度换算
+            if nm == "TankFire" and State.VehicleAim then
+                local tp = predictedPos or cachedPos
+                local org = vehiclePos
+                if tp and org then
+                    local d = tp - org
+                    local flat = Vector3.new(d.X, 0, d.Z)
+                    if flat.Magnitude > 0.5 then
+                        args[2] = math.deg(math.atan2(-d.X, -d.Z))
+                        args[3] = math.deg(math.atan2(d.Y, flat.Magnitude))
+                        State.RedirectCount = (State.RedirectCount or 0) + 1
+                    end
+                end
+                return old(self, table.unpack(args, 1, args.n))
+            end
+
+            -- ④ 直升机瞄准同步: (id, yaw, pitch, spin)
+            if nm == "HeliGunAim" and State.VehicleAim then
+                local tp = predictedPos or cachedPos
+                local org = vehiclePos
+                if tp and org then
+                    local d = tp - org
+                    local flat = Vector3.new(d.X, 0, d.Z)
+                    if flat.Magnitude > 0.5 then
+                        args[2] = math.deg(math.atan2(-d.X, -d.Z))
+                        args[3] = math.deg(math.atan2(d.Y, flat.Magnitude))
+                    end
+                end
+                return old(self, table.unpack(args, 1, args.n))
+            end
+
+            -- 未匹配: 原样透传
             return old(self, ...)
         end)
         setreadonly(mt, true)
@@ -360,7 +495,7 @@ installNamecall()
 -- ============================================================
 local espFolder = Instance.new("Folder")
 espFolder.Name = "VF_ESP"
-espFolder.Parent = Workspace
+espFolder.Parent = (gethui and gethui()) or LP:WaitForChild("PlayerGui")
 
 local function createBox(model)
     local hl = Instance.new("Highlight")
@@ -380,37 +515,35 @@ local espCache = {}
 task.spawn(function()
     while true do
         task.wait(0.25)
-        -- 清理
-        for m, e in pairs(espCache) do
-            if not m.Parent or not e.alive then
-                if e.hl then e.hl:Destroy() end
-                if e.label then e.label:Destroy() end
-                espCache[m] = nil
-            end
-        end
-        espFolder:ClearAllChildren()
-        for m, e in pairs(espCache) do e.alive = false end
-
         if State.ESPEnabled then
             local enemies = getEnemies()
+            local alive = {}
             for _, en in ipairs(enemies) do
                 local m = en.model
-                local ok2 = true
-                if State.ESPTeamCheck then ok2 = isEnemy(en.part) end
-                if ok2 then
-                    local e = espCache[m]
-                    if not e then
-                        local hl = createBox(m)
-                        e = { hl = hl, label = nil, alive = true }
-                        espCache[m] = e
-                    else
-                        e.alive = true
-                        if not e.hl or not e.hl.Parent then
-                            e.hl = createBox(m)
-                        end
+                alive[m] = true
+                local e = espCache[m]
+                if not e then
+                    e = { hl = createBox(m), alive = true }
+                    espCache[m] = e
+                else
+                    e.alive = true
+                    if not e.hl or not e.hl.Parent then
+                        e.hl = createBox(m)
                     end
                 end
             end
+            -- 清理不在列表里的
+            for m, e in pairs(espCache) do
+                if not alive[m] or not m.Parent then
+                    if e.hl then e.hl:Destroy() end
+                    espCache[m] = nil
+                end
+            end
+        else
+            for m, e in pairs(espCache) do
+                if e.hl then e.hl:Destroy() end
+            end
+            espCache = {}
         end
     end
 end)
@@ -449,7 +582,11 @@ RunService.RenderStepped:Connect(function()
         local part = en.part
         local sp = Camera:WorldToViewportPoint(part.Position)
         local dist = (part.Position - Camera.CFrame.Position).Magnitude
-        if sp.X > -200 and sp.X < Camera.ViewportSize.X + 200 and dist <= State.ESPMaxDist then
+        -- ★ 关键: sp.Z > 0 表示在相机前方, 否则是镜像坐标(假的)
+        local inFront = sp.Z > 0
+        if inFront and sp.X > -100 and sp.X < Camera.ViewportSize.X + 100
+           and sp.Y > -100 and sp.Y < Camera.ViewportSize.Y + 100
+           and dist <= State.ESPMaxDist then
             local lines = {}
             if State.ESPName then table.insert(lines, m.Name) end
             if State.ESPDistance then table.insert(lines, string.format("%dm", math.floor(dist / 3.5))) end
@@ -658,38 +795,8 @@ AboutTab:Paragraph({
 local UIS = game:GetService("UserInputService")
 
 -- 找 WindUI 主窗口: ScreenGui "WindUI" → Folder "Window" → Frame(560x420)
-local function findMainFrame()
-    local ok, hui = pcall(function() return gethui() end)
-    local container = (ok and hui) or LP:WaitForChild("PlayerGui")
-    for _, d in ipairs(container:GetChildren()) do
-        if d:IsA("ScreenGui") and d.Name == "WindUI" then
-            local winFolder = d:FindFirstChild("Window")
-            if winFolder then
-                for _, c in ipairs(winFolder:GetChildren()) do
-                    if c:IsA("Frame") and c.Size.X.Offset >= 400 then
-                        return c
-                    end
-                end
-            end
-        end
-    end
-    return nil
-end
-
-local function toggleWindow()
-    local frame = findMainFrame()
-    if not frame then
-        if floatingBtn then
-            -- 找不到就至少把悬浮按钮显示出来提示用户
-            floatingBtn.Visible = true
-        end
-        return
-    end
-    frame.Visible = not frame.Visible
-    if floatingBtn then floatingBtn.Visible = not frame.Visible end
-end
-
--- 悬浮按钮 (窗口隐藏时显示)
+-- 找 WindUI 的 ScreenGui (整层开关最可靠)
+-- 悬浮按钮 (窗口隐藏时的恢复入口)
 local floatGui = Instance.new("ScreenGui")
 floatGui.Name = "VF_FloatBtn"
 floatGui.ResetOnSpawn = false
@@ -714,6 +821,32 @@ local fbStroke = Instance.new("UIStroke")
 fbStroke.Color = Color3.fromRGB(0, 180, 255)
 fbStroke.Thickness = 1.5
 fbStroke.Parent = floatingBtn
+
+local function getWindGui()
+    local ok, hui = pcall(function() return gethui() end)
+    local container = (ok and hui) or LP:WaitForChild("PlayerGui")
+    for _, d in ipairs(container:GetChildren()) do
+        if d:IsA("ScreenGui") and d.Name == "WindUI" then
+            return d
+        end
+    end
+    return nil
+end
+
+local uiHidden = false
+local function toggleWindow()
+    local gui = getWindGui()
+
+    if not gui then
+        if floatingBtn then floatingBtn.Visible = true end
+        return
+    end
+    uiHidden = not uiHidden
+    gui.Enabled = not uiHidden
+    if floatingBtn then floatingBtn.Visible = uiHidden end
+end
+
+VF.ToggleWindow = toggleWindow
 
 floatingBtn.MouseButton1Click:Connect(function()
     toggleWindow()
