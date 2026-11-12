@@ -52,6 +52,11 @@ local State = {
 
     -- 载具武器
     VehicleAim = true,
+
+    -- 穿墙子弹
+    WallBang = false,
+    WallBangOffset = 6,      -- 起点前移距离
+
 }
 
 getgenv().VF = State
@@ -144,6 +149,41 @@ VF.GetEnemies = getEnemies
 State.PredictEnabled = true
 State.PredictMaxTime = 0.6      -- 最多预判 0.6 秒, 防止甩飞
 
+-- ============================================================
+-- 弹道物理 (复用游戏自己的 Ballistics 模块)
+--   SPEED=1700 / RIFLE=2400 / GRAVITY=24.525 / DRAG=0.0014
+--   弹速 >= 2000 → 直线弹道; < 2000 → 有下坠
+-- ============================================================
+local Ballistics = nil
+local ballisticFn = nil
+pcall(function()
+    local vx = RS:FindFirstChild("Voxel")
+    local B = vx and vx:FindFirstChild("Ballistics")
+    if B then
+        local ok, mod = pcall(require, B)
+        if ok and type(mod) == "table" then
+            Ballistics = mod
+            if type(mod.launch) == "function" then
+                ballisticFn = mod.launch
+            end
+        end
+    end
+end)
+State.HasBallistics = ballisticFn ~= nil
+print("[VF] 弹道模块: " .. tostring(ballisticFn ~= nil))
+
+-- 计算发射方向 (含下坠补偿)
+local function computeShotDir(from, to)
+    if ballisticFn then
+        local ok, dir = pcall(ballisticFn, from, to, State.CurrentBulletSpeed or 2400)
+        if ok and typeof(dir) == "Vector3" then
+            return dir
+        end
+    end
+    local d = to - from
+    return d.Magnitude > 0.1 and d.Unit or Vector3.new(0, 0, -1)
+end
+
 -- 弹速自动读取
 local bulletSpeed = 1000
 local travelTimeFn = nil
@@ -159,6 +199,32 @@ pcall(function()
     end
 end)
 State.BulletSpeed = bulletSpeed
+State.CurrentBulletSpeed = bulletSpeed
+
+-- 动态读当前武器弹速 (每 0.5 秒)
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        pcall(function()
+            local char = LP.Character
+            if not char then return end
+            local tool = char:FindFirstChildOfClass("Tool")
+            if not tool then return end
+            -- 从武器 Client 脚本推断: 步枪类 2400, DMR 1500, 狙击 1600-2000
+            local nm = tool.Name
+            local speed = bulletSpeed
+            local n = string.lower(nm)
+            if string.find(n, "sniper") then speed = 1900
+            elseif string.find(n, "dmr") then speed = 1500
+            elseif string.find(n, "smg") then speed = 1700
+            elseif string.find(n, "lmg") then speed = 1700
+            elseif string.find(n, "pistol") then speed = 1700
+            elseif string.find(n, "shotgun") then speed = 1500
+            else speed = 2400 end   -- 步枪类默认 2400
+            State.CurrentBulletSpeed = speed
+        end)
+    end
+end)
 print("[VF] 弹速自动检测: " .. tostring(bulletSpeed))
 
 -- 敌人速度追踪表
@@ -323,6 +389,7 @@ VF.PickTarget = pickTarget
 
 -- 目标缓存
 local cachedTarget, cachedPos, predictedPos = nil, nil, nil
+local shotDirCache = nil
 local vehiclePos = nil
 task.spawn(function()
     while true do
@@ -338,20 +405,31 @@ task.spawn(function()
             else
                 predictedPos = nil
             end
+
+            -- ★ 预计算射击方向 (含弹道下坠补偿)
+            shotDirCache = nil
+            if predictedPos and Camera then
+                local from = Camera.CFrame.Position
+                pcall(function()
+                    shotDirCache = computeShotDir(from, predictedPos)
+                end)
+            end
             State.cachedTarget = cachedTarget
             State.cachedPos = cachedPos
             State.predictedPos = predictedPos
 
             -- 缓存载具位置 (供 hook 里做角度换算, 避免重入)
-            vehiclePos = nil
+            local vp = nil
             pcall(function()
                 local c = LP.Character
                 if not c then return end
                 local hrp = c:FindFirstChild("HumanoidRootPart")
                 if hrp and LP:GetAttribute("InVehicle") then
-                    vehiclePos = hrp.Position
+                    vp = hrp.Position
                 end
             end)
+            vehiclePos = vp
+            State.vehiclePos = vp
         else
             cachedTarget, cachedPos = nil, nil
             State.cachedTarget = nil
@@ -424,13 +502,28 @@ local function installNamecall()
             if FIRE_NAMES[nm] then
                 local a1, a2 = args[1], args[2]
                 if typeof(a1) == "Vector3" and typeof(a2) == "Vector3" then
-                    local tp = cachedPos
-                    if tp then
-                        local d = tp - a1
-                        if d.Magnitude > 1 then
-                            args[2] = d.Unit
-                            State.RedirectCount = (State.RedirectCount or 0) + 1
+                    -- ★ 用预计算的含下坠方向; 没有则退回直线
+                    local dir = shotDirCache
+                    if not dir then
+                        local tp = predictedPos or cachedPos
+                        if tp then
+                            local d = tp - a1
+                            if d.Magnitude > 1 then dir = d.Unit end
                         end
+                    end
+                    if dir then
+                        -- ★ 穿墙: 把起点移到目标附近, 服务端射线绕开墙体
+                        if State.WallBang then
+                            local tp = predictedPos or cachedPos
+                            if tp then
+                                local gap = (tp - a1).Magnitude
+                                if gap > (State.WallBangOffset + 2) then
+                                    args[1] = tp - dir * State.WallBangOffset
+                                end
+                            end
+                        end
+                        args[2] = dir
+                        State.RedirectCount = (State.RedirectCount or 0) + 1
                     end
                 end
                 return old(self, table.unpack(args, 1, args.n))
@@ -455,8 +548,13 @@ local function installNamecall()
                     local d = tp - org
                     local flat = Vector3.new(d.X, 0, d.Z)
                     if flat.Magnitude > 0.5 then
-                        args[2] = math.deg(math.atan2(-d.X, -d.Z))
-                        args[3] = math.deg(math.atan2(d.Y, flat.Magnitude))
+                        -- ★ 复刻游戏 DeathCam 公式: yaw=atan2(X,Z), pitch 弧度+clamp
+                        args[2] = math.atan2(d.X, d.Z)
+                        args[3] = math.clamp(
+                            math.atan2(d.Y, flat.Magnitude),
+                            0.13962634015954636,
+                            1.3089969389957472
+                        )
                         State.RedirectCount = (State.RedirectCount or 0) + 1
                     end
                 end
@@ -471,8 +569,9 @@ local function installNamecall()
                     local d = tp - org
                     local flat = Vector3.new(d.X, 0, d.Z)
                     if flat.Magnitude > 0.5 then
-                        args[2] = math.deg(math.atan2(-d.X, -d.Z))
-                        args[3] = math.deg(math.atan2(d.Y, flat.Magnitude))
+                        -- ★ 游戏公式: yaw=atan2(X,Z)
+                        args[2] = math.atan2(d.X, d.Z)
+                        args[3] = math.atan2(d.Y, flat.Magnitude)
                     end
                 end
                 return old(self, table.unpack(args, 1, args.n))
@@ -706,6 +805,17 @@ AimTab:Toggle({
     Value = false,
     Callback = function(s) State.ShowIndicator = s end,
 })
+AimTab:Toggle({
+    Title = "穿墙子弹 (WallBang)",
+    Value = false,
+    Callback = function(s) State.WallBang = s end,
+})
+AimTab:Slider({
+    Title = "穿墙起点前移",
+    Value = { Min = 2, Max = 20, Default = 6 },
+    Callback = function(v) State.WallBangOffset = v end,
+})
+
 AimTab:Toggle({
     Title = "载具武器静默 (直升机/坦克)",
     Value = true,
