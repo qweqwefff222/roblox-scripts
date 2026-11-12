@@ -53,9 +53,6 @@ local State = {
     -- 载具武器
     VehicleAim = true,
 
-    -- 穿墙子弹
-    WallBang = false,
-    WallBangOffset = 6,      -- 起点前移距离
 
 }
 
@@ -184,22 +181,29 @@ local function computeShotDir(from, to)
     return d.Magnitude > 0.1 and d.Unit or Vector3.new(0, 0, -1)
 end
 
--- 弹速自动读取
-local bulletSpeed = 1000
+-- 弹速自动读取 (优先用 Ballistics 的真实常量)
+local bulletSpeed = 2400        -- 默认按步枪
 local travelTimeFn = nil
+local BP = { SPEED = 1700, RIFLE_SPEED = 2400, DMR_SPEED = 1500,
+             SNIPER_MIN = 1600, STRAIGHT_MIN = 2000,
+             GRAVITY = 24.525, DRAG = 0.0014, ZERO = 250 }
 pcall(function()
     local vx = RS:FindFirstChild("Voxel")
-    local T = vx and vx:FindFirstChild("Tracers")
-    if T then
-        local ok, mod = pcall(require, T)
+    local B = vx and vx:FindFirstChild("Ballistics")
+    if B then
+        local ok, mod = pcall(require, B)
         if ok and type(mod) == "table" then
-            if type(mod.SPEED) == "number" then bulletSpeed = mod.SPEED end
-            if type(mod.travelTime) == "function" then travelTimeFn = mod.travelTime end
+            for k, v in pairs(mod) do
+                if type(v) == "number" then BP[k] = v end
+            end
+            if type(mod.RIFLE_SPEED) == "number" then bulletSpeed = mod.RIFLE_SPEED end
         end
     end
 end)
+-- 弹速表交给下游使用
+State._BP = BP
 State.BulletSpeed = bulletSpeed
-State.CurrentBulletSpeed = bulletSpeed
+State.CurrentBulletSpeed = bulletSpeed   -- 默认步枪 2400
 
 -- 动态读当前武器弹速 (每 0.5 秒)
 task.spawn(function()
@@ -211,16 +215,15 @@ task.spawn(function()
             local tool = char:FindFirstChildOfClass("Tool")
             if not tool then return end
             -- 从武器 Client 脚本推断: 步枪类 2400, DMR 1500, 狙击 1600-2000
-            local nm = tool.Name
-            local speed = bulletSpeed
-            local n = string.lower(nm)
-            if string.find(n, "sniper") then speed = 1900
-            elseif string.find(n, "dmr") then speed = 1500
-            elseif string.find(n, "smg") then speed = 1700
-            elseif string.find(n, "lmg") then speed = 1700
-            elseif string.find(n, "pistol") then speed = 1700
-            elseif string.find(n, "shotgun") then speed = 1500
-            else speed = 2400 end   -- 步枪类默认 2400
+            local n = string.lower(tool.Name)
+            local speed
+            if string.find(n, "sniper") then speed = BP.SPEED or 1700
+            elseif string.find(n, "dmr") then speed = BP.DMR_SPEED or 1500
+            elseif string.find(n, "shotgun") then speed = BP.DMR_SPEED or 1500
+            elseif string.find(n, "smg") then speed = BP.SPEED or 1700
+            elseif string.find(n, "lmg") then speed = BP.SPEED or 1700
+            elseif string.find(n, "pistol") then speed = BP.SPEED or 1700
+            else speed = BP.RIFLE_SPEED or 2400 end
             State.CurrentBulletSpeed = speed
         end)
     end
@@ -390,6 +393,7 @@ VF.PickTarget = pickTarget
 -- 目标缓存
 local cachedTarget, cachedPos, predictedPos = nil, nil, nil
 local shotDirCache = nil
+local aimPointCache = nil
 local vehiclePos = nil
 task.spawn(function()
     while true do
@@ -406,17 +410,30 @@ task.spawn(function()
                 predictedPos = nil
             end
 
-            -- ★ 预计算射击方向 (含弹道下坠补偿)
-            shotDirCache = nil
-            if predictedPos and Camera then
-                local from = Camera.CFrame.Position
+            -- ★ 预计算「瞄准点」: 目标预测位置 + 弹道落点修正
+            --   hook 里只做 (aimPoint - 真实枪口).Unit, 纯数学不重入
+            aimPointCache = nil
+            if predictedPos then
                 pcall(function()
-                    shotDirCache = computeShotDir(from, predictedPos)
+                    local from = Camera.CFrame.Position
+                    local to = predictedPos
+                    local dist = (to - from).Magnitude
+                    local speed = State.CurrentBulletSpeed or 2400
+                    if Ballistics then
+                        -- 算出子弹按直线飞会落在哪, 再把差值补回目标
+                        local dir0 = (to - from).Unit
+                        local t = Ballistics.flightTime(dist, speed)
+                        local landed = Ballistics.position(from, dir0, t, speed)
+                        aimPointCache = to + (to - landed)
+                    else
+                        aimPointCache = to
+                    end
                 end)
             end
             State.cachedTarget = cachedTarget
             State.cachedPos = cachedPos
             State.predictedPos = predictedPos
+            State.aimPoint = aimPointCache
 
             -- 缓存载具位置 (供 hook 里做角度换算, 避免重入)
             local vp = nil
@@ -502,28 +519,15 @@ local function installNamecall()
             if FIRE_NAMES[nm] then
                 local a1, a2 = args[1], args[2]
                 if typeof(a1) == "Vector3" and typeof(a2) == "Vector3" then
-                    -- ★ 用预计算的含下坠方向; 没有则退回直线
-                    local dir = shotDirCache
-                    if not dir then
-                        local tp = predictedPos or cachedPos
-                        if tp then
-                            local d = tp - a1
-                            if d.Magnitude > 1 then dir = d.Unit end
+                    -- ★ 用「真实枪口 a1」指向预计算的瞄准点 → 纯数学, 零重入
+                    --   这样玩家自己移动也被自动补偿 (a1 是开火瞬间的真实位置)
+                    local aim = aimPointCache or predictedPos or cachedPos
+                    if aim then
+                        local d = aim - a1
+                        if d.Magnitude > 1 then
+                            args[2] = d.Unit
+                            State.RedirectCount = (State.RedirectCount or 0) + 1
                         end
-                    end
-                    if dir then
-                        -- ★ 穿墙: 把起点移到目标附近, 服务端射线绕开墙体
-                        if State.WallBang then
-                            local tp = predictedPos or cachedPos
-                            if tp then
-                                local gap = (tp - a1).Magnitude
-                                if gap > (State.WallBangOffset + 2) then
-                                    args[1] = tp - dir * State.WallBangOffset
-                                end
-                            end
-                        end
-                        args[2] = dir
-                        State.RedirectCount = (State.RedirectCount or 0) + 1
                     end
                 end
                 return old(self, table.unpack(args, 1, args.n))
@@ -805,17 +809,6 @@ AimTab:Toggle({
     Value = false,
     Callback = function(s) State.ShowIndicator = s end,
 })
-AimTab:Toggle({
-    Title = "穿墙子弹 (WallBang)",
-    Value = false,
-    Callback = function(s) State.WallBang = s end,
-})
-AimTab:Slider({
-    Title = "穿墙起点前移",
-    Value = { Min = 2, Max = 20, Default = 6 },
-    Callback = function(v) State.WallBangOffset = v end,
-})
-
 AimTab:Toggle({
     Title = "载具武器静默 (直升机/坦克)",
     Value = true,
