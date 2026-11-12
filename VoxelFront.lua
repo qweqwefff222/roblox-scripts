@@ -447,12 +447,10 @@ VF.IsVisible = visible
 -- 目标缓存 (原始版本)
 local cachedTarget, cachedPos, predictedPos = nil, nil, nil
 
-local MY_GEN2 = getgenv().__VF_GEN or 0
 task.spawn(function()
     local lastGood = 0
     while true do
         task.wait(0.03)
-        if getgenv().__VF_GEN ~= MY_GEN2 then return end
         if State.SilentEnabled then
             local ok, t = pcall(pickTarget)
             if ok and t then
@@ -791,8 +789,7 @@ end
 VF.TryReload = tryReload
 
 -- 实例代次: 新脚本加载会递增, 旧的循环自动退出
-local MY_GEN = (getgenv().__VF_GEN or 0) + 1
-getgenv().__VF_GEN = MY_GEN
+local MY_GEN = getgenv().__VF_GEN or 0   -- 本实例的代次(由文件顶部统一设置)
 
 -- 一直装弹
 task.spawn(function()
@@ -801,7 +798,7 @@ task.spawn(function()
     while true do
         task.wait(0.2)
         -- ★ 代次不符说明有更新的实例加载了, 主动退出
-        if getgenv().__VF_GEN ~= MY_GEN then return end
+
         if State.AlwaysReload and getgenv().VF == State then
             local cur = State.RedirectCount or 0
             if cur ~= lastCount then
