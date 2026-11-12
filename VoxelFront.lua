@@ -34,9 +34,9 @@ local Camera = Workspace.CurrentCamera
 local State = {
     -- 静默瞄准
     SilentEnabled = false,
-    SilentFOV = 300,
+    SilentFOV = 800,
     SilentHeadOnly = true,
-    SilentWallCheck = false,
+    SilentWallCheck = false,   -- 默认关: 此游戏地形多, 开会过滤掉几乎所有目标
     Priority = "crosshair",   -- crosshair | near | far | hpLow | hpHigh
     ShowFOV = false,
     ShowIndicator = false,
@@ -53,9 +53,13 @@ local State = {
     -- 载具武器
     VehicleAim = true,
 
+    -- 下坠补偿 (默认关, 和步枪一致走直线)
+    DropComp = false,
+
 
 }
 
+local VF = State
 getgenv().VF = State
 
 -- ============================================================
@@ -152,7 +156,6 @@ State.PredictMaxTime = 0.6      -- 最多预判 0.6 秒, 防止甩飞
 --   弹速 >= 2000 → 直线弹道; < 2000 → 有下坠
 -- ============================================================
 local Ballistics = nil
-local ballisticFn = nil
 pcall(function()
     local vx = RS:FindFirstChild("Voxel")
     local B = vx and vx:FindFirstChild("Ballistics")
@@ -160,74 +163,110 @@ pcall(function()
         local ok, mod = pcall(require, B)
         if ok and type(mod) == "table" then
             Ballistics = mod
-            if type(mod.launch) == "function" then
-                ballisticFn = mod.launch
-            end
-        end
+                    end
     end
 end)
-State.HasBallistics = ballisticFn ~= nil
-print("[VF] 弹道模块: " .. tostring(ballisticFn ~= nil))
+State.HasBallistics = nil ~= nil
+print("[VF] 弹道模块: " .. tostring(Ballistics ~= nil))
 
--- 计算发射方向 (含下坠补偿)
-local function computeShotDir(from, to)
-    if ballisticFn then
-        local ok, dir = pcall(ballisticFn, from, to, State.CurrentBulletSpeed or 2400)
-        if ok and typeof(dir) == "Vector3" then
-            return dir
-        end
-    end
-    local d = to - from
-    return d.Magnitude > 0.1 and d.Unit or Vector3.new(0, 0, -1)
-end
 
--- 弹速自动读取 (优先用 Ballistics 的真实常量)
-local bulletSpeed = 2400        -- 默认按步枪
-local travelTimeFn = nil
+
+-- ============================================================
+-- 武器弹道数据 (全部从游戏源码读出, 22 把武器)
+--   Ballistics.RIFLE_SPEED = 2400  ← 基准弹速
+--   实际弹速 = 2400 * Gunsmith.velocity(tool)   (无改装时 = 1)
+--   是否下坠看 GUNS[id].flies 字段, 不看弹速
+--     Rifle/SMG/LMG/Pistol → flies=false → 直线
+--     DMR(FS16/GV12/KR54) / Sniper(SC11/RX10) → flies=true → 有下坠
+-- ============================================================
 local BP = { SPEED = 1700, RIFLE_SPEED = 2400, DMR_SPEED = 1500,
              SNIPER_MIN = 1600, STRAIGHT_MIN = 2000,
              GRAVITY = 24.525, DRAG = 0.0014, ZERO = 250 }
-pcall(function()
+local Ballistics, gsMod = nil, nil
+
+-- 弹道模块 (多重路径尝试)
+local function tryLoadBallistics()
+    local paths = {
+        function() return RS:FindFirstChild("Voxel"):FindFirstChild("Ballistics") end,
+        function() return RS:FindFirstChild("Voxel"):FindFirstChild("Ballistics") end,
+    }
     local vx = RS:FindFirstChild("Voxel")
     local B = vx and vx:FindFirstChild("Ballistics")
-    if B then
-        local ok, mod = pcall(require, B)
-        if ok and type(mod) == "table" then
-            for k, v in pairs(mod) do
-                if type(v) == "number" then BP[k] = v end
-            end
-            if type(mod.RIFLE_SPEED) == "number" then bulletSpeed = mod.RIFLE_SPEED end
+    if not B then return end
+    local ok, mod = pcall(require, B)
+    if ok and type(mod) == "table" then
+        Ballistics = mod
+        for k, v in pairs(mod) do
+            if type(v) == "number" then BP[k] = v end
+        end
+    end
+end
+tryLoadBallistics()
+
+pcall(function()
+    local gsFolder = RS:FindFirstChild("Gunsmith")
+    local g = gsFolder and gsFolder:FindFirstChild("Gunsmith")
+    if g then
+        local ok, mod = pcall(require, g)
+        if ok and type(mod) == "table" then gsMod = mod end
+    end
+end)
+
+State.HasBallistics = Ballistics ~= nil
+State.HasGunsmith = gsMod ~= nil
+
+-- 汇总所有武器 flies 标记 (从各 Specs 的 GUNS 表)
+local FLIES = {}
+pcall(function()
+    if not gsMod or type(gsMod.GUNS) ~= "table" then return end
+    for id, e in pairs(gsMod.GUNS) do
+        if type(e) == "table" then
+            FLIES[id] = (e.flies == true)
         end
     end
 end)
--- 弹速表交给下游使用
-State._BP = BP
-State.BulletSpeed = bulletSpeed
-State.CurrentBulletSpeed = bulletSpeed   -- 默认步枪 2400
+State._Flies = FLIES
 
--- 动态读当前武器弹速 (每 0.5 秒)
+local bulletSpeed = BP.RIFLE_SPEED or 2400
+State._BP = BP
+
+-- 当前武器真实弹速 + 是否下坠
+local function currentWeaponInfo()
+    local char = LP.Character
+    local tool = char and char:FindFirstChildOfClass("Tool")
+    if not tool then return bulletSpeed, false end
+
+    -- 弹速 = 基准 × Gunsmith 改装系数
+    local speed = BP.RIFLE_SPEED or 2400
+    if gsMod and type(gsMod.velocity) == "function" then
+        local ok, v = pcall(gsMod.velocity, tool)
+        if ok and type(v) == "number" and v > 0 then
+            speed = speed * v
+        end
+    end
+
+    -- 是否下坠: 先查 GUNS 表, 查不到按道具名兜底
+    local flies = FLIES[tool.Name]
+    if flies == nil then
+        local n = string.lower(tool.Name)
+        flies = (string.find(n, "sniper") ~= nil)
+             or (string.find(n, "dmr") ~= nil)
+    end
+    return speed, flies
+end
+
+-- 每 0.3 秒更新
 task.spawn(function()
     while true do
-        task.wait(0.5)
+        task.wait(0.3)
         pcall(function()
-            local char = LP.Character
-            if not char then return end
-            local tool = char:FindFirstChildOfClass("Tool")
-            if not tool then return end
-            -- 从武器 Client 脚本推断: 步枪类 2400, DMR 1500, 狙击 1600-2000
-            local n = string.lower(tool.Name)
-            local speed
-            if string.find(n, "sniper") then speed = BP.SPEED or 1700
-            elseif string.find(n, "dmr") then speed = BP.DMR_SPEED or 1500
-            elseif string.find(n, "shotgun") then speed = BP.DMR_SPEED or 1500
-            elseif string.find(n, "smg") then speed = BP.SPEED or 1700
-            elseif string.find(n, "lmg") then speed = BP.SPEED or 1700
-            elseif string.find(n, "pistol") then speed = BP.SPEED or 1700
-            else speed = BP.RIFLE_SPEED or 2400 end
-            State.CurrentBulletSpeed = speed
+            local sp, fl = currentWeaponInfo()
+            State.CurrentBulletSpeed = sp
+            State.CurrentFlies = fl
         end)
     end
 end)
+
 print("[VF] 弹速自动检测: " .. tostring(bulletSpeed))
 
 -- 敌人速度追踪表
@@ -297,21 +336,22 @@ local function predictPos(target)
 
     local dist = (part.Position - origin).Magnitude
 
-    -- 飞行时间: 优先官方函数, 否则 距离/弹速
-    local flight
-    if travelTimeFn then
-        local ok, t = pcall(travelTimeFn, origin, part.Position)
-        flight = (ok and type(t) == "number") and t or (dist / bulletSpeed)
-    else
-        flight = dist / bulletSpeed
-    end
+    -- 飞行时间
+    local flight = dist / (bulletSpeed or 2400)
     flight = math.clamp(flight, 0, State.PredictMaxTime)
 
     -- 敌人速度
     local rec = velTrack[m]
     local vel = rec and rec.vel or Vector3.new(0, 0, 0)
 
-    return part.Position + vel * flight
+    -- ★ 低速目标不预判 (避免推过目标), 高速才按比例预判
+    local spd = vel.Magnitude
+    if spd < 4 then
+        return part.Position                    -- 站着不动/微动: 直接打当前位置
+    end
+    -- 预判量随速度渐入, 上限 0.75 (远距离不推太远)
+    local lead = math.clamp(spd / 20, 0, 1) * 0.75
+    return part.Position + vel * flight * lead
 end
 
 -- ============================================================
@@ -343,10 +383,17 @@ end
 local function visible(fromPos, toPos, ignoreModel)
     local rp = RaycastParams.new()
     rp.FilterType = Enum.RaycastFilterType.Exclude
-    rp.FilterDescendantsInstances = { LP.Character, ignoreModel, Camera }
+    -- 排除自己和目标本身；不排除相机（相机不是物理体）
+    rp.FilterDescendantsInstances = { LP.Character, ignoreModel }
     rp.IgnoreWater = true
-    local hit = Workspace:Raycast(fromPos, toPos - fromPos, rp)
-    return hit == nil
+    local dir = toPos - fromPos
+    local dist = dir.Magnitude
+    if dist < 1 then return true end
+    local hit = Workspace:Raycast(fromPos, dir, rp)
+    if not hit then return true end
+    -- 命中点非常接近目标（<3 米）视为可见，避免擦边误判
+    if hit.Distance >= dist - 3 then return true end
+    return false
 end
 
 local function pickTarget()
@@ -365,8 +412,10 @@ local function pickTarget()
             local screenDist = (Vector2.new(sp.X, sp.Y) - center).Magnitude
             local worldDist = (part.Position - origin).Magnitude
 
-            local inFov = screenDist <= State.SilentFOV
-            if inFov and worldDist <= 1000 then
+            -- sp.Z > 0 才算在相机前方, 否则是镜像伪坐标
+            local inFront = sp.Z > 0
+            local inFov = inFront and screenDist <= State.SilentFOV
+            if inFov and worldDist <= 1500 then
                 local pass = true
                 if State.SilentWallCheck then
                     pass = visible(origin, part.Position, e.model)
@@ -389,66 +438,23 @@ local function pickTarget()
 end
 
 VF.PickTarget = pickTarget
+VF.IsVisible = visible
 
--- 目标缓存
+-- 目标缓存 (原始版本)
 local cachedTarget, cachedPos, predictedPos = nil, nil, nil
-local shotDirCache = nil
-local aimPointCache = nil
-local vehiclePos = nil
+
 task.spawn(function()
     while true do
-        task.wait(0.04)
+        task.wait(0.05)
         if State.SilentEnabled then
             local ok, t = pcall(pickTarget)
             cachedTarget = ok and t or nil
             cachedPos = (ok and t) and t.part.Position or nil
-            -- 预计算预测位置 (在后台算, hook 里只读)
-            if ok and t then
-                local pok, pp = pcall(predictPos, t)
-                predictedPos = (pok and pp) or cachedPos
-            else
-                predictedPos = nil
-            end
-
-            -- ★ 预计算「瞄准点」: 目标预测位置 + 弹道落点修正
-            --   hook 里只做 (aimPoint - 真实枪口).Unit, 纯数学不重入
-            aimPointCache = nil
-            if predictedPos then
-                pcall(function()
-                    local from = Camera.CFrame.Position
-                    local to = predictedPos
-                    local dist = (to - from).Magnitude
-                    local speed = State.CurrentBulletSpeed or 2400
-                    if Ballistics then
-                        -- 算出子弹按直线飞会落在哪, 再把差值补回目标
-                        local dir0 = (to - from).Unit
-                        local t = Ballistics.flightTime(dist, speed)
-                        local landed = Ballistics.position(from, dir0, t, speed)
-                        aimPointCache = to + (to - landed)
-                    else
-                        aimPointCache = to
-                    end
-                end)
-            end
+            predictedPos = cachedPos
             State.cachedTarget = cachedTarget
             State.cachedPos = cachedPos
-            State.predictedPos = predictedPos
-            State.aimPoint = aimPointCache
-
-            -- 缓存载具位置 (供 hook 里做角度换算, 避免重入)
-            local vp = nil
-            pcall(function()
-                local c = LP.Character
-                if not c then return end
-                local hrp = c:FindFirstChild("HumanoidRootPart")
-                if hrp and LP:GetAttribute("InVehicle") then
-                    vp = hrp.Position
-                end
-            end)
-            vehiclePos = vp
-            State.vehiclePos = vp
         else
-            cachedTarget, cachedPos = nil, nil
+            cachedTarget, cachedPos, predictedPos = nil, nil, nil
             State.cachedTarget = nil
             State.cachedPos = nil
         end
@@ -494,99 +500,65 @@ end)
 -- 真正可用的方案: hookmetamethod 但只在目标 Remote 上改写, 并保护心跳
 local namecallInstalled = false
 local function installNamecall()
-    if namecallInstalled then return end
     local ok = pcall(function()
         local mt = getrawmetatable(game)
-        local old = mt.__namecall
+        -- ★ 先还原到「真正的原始 __namecall」, 消除重复部署叠加
+        local pure = getgenv().__VF_ORIG_NC
+        if pure == nil then
+            -- 第一次挂钩: 记录原始并保存
+            pure = rawget(mt, "__namecall")
+            getgenv().__VF_ORIG_NC = pure
+            getgenv().__VF_NC_DEPTH = 0
+        end
+        local old = pure
         setreadonly(mt, false)
-        mt.__namecall = newcclosure(function(self, ...)
+mt.__namecall = newcclosure(function(self, ...)
             local method = getnamecallmethod()
-            -- 只处理 FireServer, 其它一律原样透传 (零改动)
-            if method ~= "FireServer" then
-                return old(self, ...)
-            end
-            if not State.SilentEnabled then
-                return old(self, ...)
-            end
-            if typeof(self) ~= "Instance" then
-                return old(self, ...)
-            end
-
+            State.ncCalls = (State.ncCalls or 0) + 1
+            if method ~= "FireServer" then return old(self, ...) end
+            State.fsCalls = (State.fsCalls or 0) + 1
+            if not State.SilentEnabled then return old(self, ...) end
             local nm = self.Name
+            State.lastRemote = nm
+            if not FIRE_NAMES[nm] then
+                return old(self, ...)
+            end
+
             local args = table.pack(...)
-
-            -- ① 步兵枪械: (origin, direction, serverTime)
-            if FIRE_NAMES[nm] then
-                local a1, a2 = args[1], args[2]
-                if typeof(a1) == "Vector3" and typeof(a2) == "Vector3" then
-                    -- ★ 用「真实枪口 a1」指向预计算的瞄准点 → 纯数学, 零重入
-                    --   这样玩家自己移动也被自动补偿 (a1 是开火瞬间的真实位置)
-                    local aim = aimPointCache or predictedPos or cachedPos
-                    if aim then
-                        local d = aim - a1
-                        if d.Magnitude > 1 then
-                            args[2] = d.Unit
-                            State.RedirectCount = (State.RedirectCount or 0) + 1
-                        end
-                    end
-                end
-                return old(self, table.unpack(args, 1, args.n))
-            end
-
-            -- ② 直升机机炮: (id, "gun", hitPos)  → 改第3参数
-            if nm == "HeliFire" and State.VehicleAim then
-                local aimPos = predictedPos or cachedPos
-                if aimPos and args[2] == "gun" and typeof(args[3]) == "Vector3" then
-                    args[3] = aimPos
-                    State.RedirectCount = (State.RedirectCount or 0) + 1
-                    State.LastVehicleRedirect = os.clock()
-                end
-                return old(self, table.unpack(args, 1, args.n))
-            end
-
-            -- ③ 坦克: (id, yaw, pitch, [弹种]) → 角度换算
-            if nm == "TankFire" and State.VehicleAim then
-                local tp = predictedPos or cachedPos
-                local org = vehiclePos
-                if tp and org then
-                    local d = tp - org
-                    local flat = Vector3.new(d.X, 0, d.Z)
-                    if flat.Magnitude > 0.5 then
-                        -- ★ 复刻游戏 DeathCam 公式: yaw=atan2(X,Z), pitch 弧度+clamp
-                        args[2] = math.atan2(d.X, d.Z)
-                        args[3] = math.clamp(
-                            math.atan2(d.Y, flat.Magnitude),
-                            0.13962634015954636,
-                            1.3089969389957472
-                        )
+            local a1, a2 = args[1], args[2]
+            local hitFlag = "skip"
+            if typeof(a1) == "Vector3" and typeof(a2) == "Vector3" then
+                local tp = cachedPos
+                if tp then
+                    local d = tp - a1
+                    if d.Magnitude > 1 then
+                        args[2] = d.Unit
+                        hitFlag = "redirect"
+                        State.dbgSeq = (State.dbgSeq or 0) + 1
+                        State.dbgMuzzle = a1
+                        State.dbgOrig = a2
+                        State.dbgNew = d.Unit
+                        State.dbgAim = tp
+                        State.dbgDist = d.Magnitude
+                        State.dbgName = nm
+                        State.dbgNargs = args.n
                         State.RedirectCount = (State.RedirectCount or 0) + 1
+                    else
+                        hitFlag = "tooclose"
                     end
+                else
+                    hitFlag = "notarget"
                 end
-                return old(self, table.unpack(args, 1, args.n))
+            else
+                hitFlag = "badtypes"
             end
-
-            -- ④ 直升机瞄准同步: (id, yaw, pitch, spin)
-            if nm == "HeliGunAim" and State.VehicleAim then
-                local tp = predictedPos or cachedPos
-                local org = vehiclePos
-                if tp and org then
-                    local d = tp - org
-                    local flat = Vector3.new(d.X, 0, d.Z)
-                    if flat.Magnitude > 0.5 then
-                        -- ★ 游戏公式: yaw=atan2(X,Z)
-                        args[2] = math.atan2(d.X, d.Z)
-                        args[3] = math.atan2(d.Y, flat.Magnitude)
-                    end
-                end
-                return old(self, table.unpack(args, 1, args.n))
-            end
-
-            -- 未匹配: 原样透传
-            return old(self, ...)
+            State.dbgLastFlag = hitFlag
+            return old(self, table.unpack(args, 1, args.n))
         end)
         setreadonly(mt, true)
         namecallInstalled = true
-        print("[VF] __namecall 挂钩完成 (静默瞄准)")
+        getgenv().__VF_NC_DEPTH = (getgenv().__VF_NC_DEPTH or 0) + 1
+        print("[VF] __namecall 挂钩完成 (静默瞄准) 层级=" .. tostring(getgenv().__VF_NC_DEPTH))
     end)
     return ok
 end
@@ -720,8 +692,12 @@ ovGui.DisplayOrder = 998
 ovGui.Parent = (gethui and gethui()) or LP:WaitForChild("PlayerGui")
 
 local fovCircle = Instance.new("Frame")
+fovCircle.Name = "FOVCircle"
 fovCircle.BackgroundTransparency = 1
+fovCircle.BorderSizePixel = 0
+fovCircle.AnchorPoint = Vector2.new(0.5, 0.5)
 fovCircle.Visible = false
+fovCircle.ZIndex = 10
 fovCircle.Parent = ovGui
 local fovStroke = Instance.new("UIStroke")
 fovStroke.Thickness = 1.5
@@ -747,7 +723,7 @@ RunService.RenderStepped:Connect(function()
     if on and State.ShowFOV then
         local s = State.SilentFOV * 2
         fovCircle.Size = UDim2.new(0, s, 0, s)
-        fovCircle.Position = UDim2.new(0.5, -State.SilentFOV, 0.5, -State.SilentFOV)
+        fovCircle.Position = UDim2.new(0.5, 0, 0.5, 0)
     end
 
     if on and State.ShowIndicator and cachedPos then
@@ -796,7 +772,7 @@ AimTab:Toggle({
 })
 AimTab:Slider({
     Title = "FOV 范围",
-    Value = { Min = 50, Max = 1200, Default = 300 },
+    Value = { Min = 50, Max = 2400, Default = 800 },
     Callback = function(v) State.SilentFOV = v end,
 })
 AimTab:Toggle({
