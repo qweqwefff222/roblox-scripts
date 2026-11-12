@@ -34,7 +34,7 @@ local Camera = Workspace.CurrentCamera
 local State = {
     -- 静默瞄准
     SilentEnabled = false,
-    SilentFOV = 800,
+    SilentFOV = 127,
     SilentHeadOnly = true,
     SilentWallCheck = false,   -- 默认关: 此游戏地形多, 开会过滤掉几乎所有目标
     Priority = "crosshair",   -- crosshair | near | far | hpLow | hpHigh
@@ -60,10 +60,6 @@ local State = {
     AlwaysReload = false,
 
     -- 扩展碰撞箱
-    HitboxEnabled = false,
-    HitboxParts = "Head",      -- Head / UpperTorso / LowerTorso / HumanoidRootPart / All
-    HitboxScale = 2.0,         -- 大小倍数
-    HitboxSafe = true,         -- 安全模式: 用附加方块而非改原部件
 
 
 }
@@ -421,7 +417,6 @@ local function pickTarget()
             local screenDist = (Vector2.new(sp.X, sp.Y) - center).Magnitude
             local worldDist = (part.Position - origin).Magnitude
 
-            -- sp.Z > 0 才算在相机前方, 否则是镜像伪坐标
             local inFront = sp.Z > 0
             local inFov = inFront and screenDist <= State.SilentFOV
             if inFov and worldDist <= 1500 then
@@ -452,18 +447,34 @@ VF.IsVisible = visible
 -- 目标缓存 (原始版本)
 local cachedTarget, cachedPos, predictedPos = nil, nil, nil
 
+local MY_GEN2 = getgenv().__VF_GEN or 0
 task.spawn(function()
+    local lastGood = 0
     while true do
-        task.wait(0.05)
+        task.wait(0.03)
+        if getgenv().__VF_GEN ~= MY_GEN2 then return end
         if State.SilentEnabled then
             local ok, t = pcall(pickTarget)
-            cachedTarget = ok and t or nil
-            cachedPos = (ok and t) and t.part.Position or nil
-            predictedPos = cachedPos
-            State.cachedTarget = cachedTarget
-            State.cachedPos = cachedPos
+            if ok and t then
+                cachedTarget = t
+                cachedPos = t.part.Position
+                predictedPos = cachedPos
+                lastGood = os.clock()
+                State.cachedTarget = cachedTarget
+                State.cachedPos = cachedPos
+                State.cacheMiss = 0
+            else
+                -- ★ 关键: 失败时保留上次有效值 0.5 秒, 避免开枪瞬间缓存为空
+                State.cacheMiss = (State.cacheMiss or 0) + 1
+                if os.clock() - lastGood > 0.5 then
+                    cachedTarget, cachedPos, predictedPos = nil, nil, nil
+                    State.cachedTarget = nil
+                    State.cachedPos = nil
+                end
+            end
         else
             cachedTarget, cachedPos, predictedPos = nil, nil, nil
+            lastGood = 0
             State.cachedTarget = nil
             State.cachedPos = nil
         end
@@ -523,46 +534,25 @@ local function installNamecall()
         setreadonly(mt, false)
 mt.__namecall = newcclosure(function(self, ...)
             local method = getnamecallmethod()
-            -- 计数放在后面, 避免每帧开销
             if method ~= "FireServer" then return old(self, ...) end
-            State.ncCalls = (State.ncCalls or 0) + 1
-            State.fsCalls = (State.fsCalls or 0) + 1
             if not State.SilentEnabled then return old(self, ...) end
             local nm = self.Name
-            State.lastRemote = nm
             if not FIRE_NAMES[nm] then
                 return old(self, ...)
             end
 
             local args = table.pack(...)
             local a1, a2 = args[1], args[2]
-            local hitFlag = "skip"
             if typeof(a1) == "Vector3" and typeof(a2) == "Vector3" then
                 local tp = cachedPos
                 if tp then
                     local d = tp - a1
                     if d.Magnitude > 1 then
                         args[2] = d.Unit
-                        hitFlag = "redirect"
-                        State.dbgSeq = (State.dbgSeq or 0) + 1
-                        State.dbgMuzzle = a1
-                        State.dbgOrig = a2
-                        State.dbgNew = d.Unit
-                        State.dbgAim = tp
-                        State.dbgDist = d.Magnitude
-                        State.dbgName = nm
-                        State.dbgNargs = args.n
                         State.RedirectCount = (State.RedirectCount or 0) + 1
-                    else
-                        hitFlag = "tooclose"
                     end
-                else
-                    hitFlag = "notarget"
                 end
-            else
-                hitFlag = "badtypes"
             end
-            State.dbgLastFlag = hitFlag
             return old(self, table.unpack(args, 1, args.n))
         end)
         setreadonly(mt, true)
@@ -753,197 +743,6 @@ RunService.RenderStepped:Connect(function()
 end)
 
 -- ============================================================
--- 扩展碰撞箱 (Hitbox Expander)
---   直接放大敌人部位的 Size, 保存原尺寸以便还原
---   部位可选: Head / UpperTorso / LowerTorso / HumanoidRootPart / All
--- ============================================================
-local HB_PARTS = {
-    Head = { "Head" },
-    Torso = { "UpperTorso", "LowerTorso" },
-    Root = { "HumanoidRootPart" },
-    All = { "Head", "UpperTorso", "LowerTorso", "HumanoidRootPart",
-            "LeftUpperArm", "RightUpperArm", "LeftUpperLeg", "RightUpperLeg" },
-}
-
-local hbOriginal = {}   -- [part] = originalSize
-local hbApplied = {}    -- [part] = true
-
-local function restoreHitbox()
-    for part, rec in pairs(hbOriginal) do
-        if part and part.Parent then
-            pcall(function()
-                part.Size = rec.size
-                part.CanCollide = rec.canCollide
-                part.Massless = rec.massless
-            end)
-        end
-    end
-    hbOriginal = {}
-    hbApplied = {}
-end
-VF.RestoreHitbox = restoreHitbox
-
-local function applyHitbox()
-    local scale = State.HitboxScale or 2.0
-    local key = State.HitboxParts or "Head"
-    local names = HB_PARTS[key] or HB_PARTS.Head
-    local set = {}
-    for _, n in ipairs(names) do set[n] = true end
-
-    for _, e in ipairs(getEnemies()) do
-        local m = e.model
-        if m then
-            for _, n in ipairs(names) do
-                local part = m:FindFirstChild(n)
-                if part and part:IsA("BasePart") then
-                    if not hbOriginal[part] then
-                        hbOriginal[part] = {
-                            size = part.Size,
-                            canCollide = part.CanCollide,
-                            massless = part.Massless,
-                        }
-                    end
-                    local orig = hbOriginal[part]
-                    local target = Vector3.new(orig.size.X * scale, orig.size.Y * scale, orig.size.Z * scale)
-                    pcall(function()
-                        -- ★ 关键: 关闭碰撞 + 无质量, 防止本地物理卡住/推挤
-                        part.CanCollide = false
-                        part.Massless = true
-                        if part.Size ~= target then
-                            part.Size = target
-                        end
-                    end)
-                    hbApplied[part] = true
-                end
-            end
-        end
-    end
-end
-
--- 启动时清理历史残留 (之前部署可能留下被放大的部件)
-task.spawn(function()
-    task.wait(0.5)
-    pcall(function()
-        local HB_NAMES = { Head = true, UpperTorso = true, LowerTorso = true,
-                           HumanoidRootPart = true,
-                           LeftUpperArm = true, RightUpperArm = true,
-                           LeftUpperLeg = true, RightUpperLeg = true }
-        local BR_DEFAULT = {
-            Head = Vector3.new(1.2, 1.2, 1.21),
-            UpperTorso = Vector3.new(2, 1.6, 1),
-            LowerTorso = Vector3.new(2, 0.4, 1),
-            HumanoidRootPart = Vector3.new(2, 2, 1),
-        }
-        -- 只扫 BotRigs 和玩家角色, 不遍历整个 workspace (75k+ 方块会卡死)
-        local br = workspace:FindFirstChild("BotRigs")
-        local targets = {}
-        if br then
-            for _, m in ipairs(br:GetChildren()) do
-                if m:IsA("Model") then table.insert(targets, m) end
-            end
-        end
-        for _, p in ipairs(game:GetService("Players"):GetPlayers()) do
-            if p.Character then table.insert(targets, p.Character) end
-        end
-
-        for _, m in ipairs(targets) do
-            for name, def in pairs(BR_DEFAULT) do
-                local part = m:FindFirstChild(name)
-                if part and part:IsA("BasePart") then
-                    if part.Size.Y > def.Y * 1.8 then
-                        pcall(function() part.Size = def end)
-                    end
-                end
-            end
-        end
-    end)
-end)
-
--- 安全模式: 在敌人部位位置放一个透明无碰撞的辅助方块 (物理零影响)
-local safeBoxes = {}   -- [model] = { [name] = part }
-
-local function clearSafeBoxes()
-    for m, set in pairs(safeBoxes) do
-        for _, p in pairs(set) do
-            if p and p.Parent then pcall(function() p:Destroy() end) end
-        end
-    end
-    safeBoxes = {}
-end
-VF.ClearSafeBoxes = clearSafeBoxes
-
-local function applySafeHitbox()
-    local scale = State.HitboxScale or 2.0
-    local key = State.HitboxParts or "Head"
-    local names = HB_PARTS[key] or HB_PARTS.Head
-    local folder = Workspace:FindFirstChild("VF_Hitbox")
-    if not folder then
-        folder = Instance.new("Folder")
-        folder.Name = "VF_Hitbox"
-        folder.Parent = Workspace
-    end
-
-    for _, e in ipairs(getEnemies()) do
-        local m = e.model
-        if m then
-            local set = safeBoxes[m]
-            if not set then
-                set = {}
-                safeBoxes[m] = set
-            end
-            for _, n in ipairs(names) do
-                local src = m:FindFirstChild(n)
-                if src and src:IsA("BasePart") then
-                    local box = set[n]
-                    if not box or not box.Parent then
-                        box = Instance.new("Part")
-                        box.Name = "VF_HB_" .. n
-                        box.Anchored = true
-                        box.CanCollide = false
-                        box.CanTouch = false
-                        box.CanQuery = true
-                        box.Transparency = 1
-                        box.Massless = true
-                        box.CastShadow = false
-                        box.Parent = folder
-                        set[n] = box
-                    end
-                    -- 跟随部位位置, 尺寸按倍数放大
-                    box.CFrame = src.CFrame
-                    local s = src.Size
-                    local t = Vector3.new(s.X * scale, s.Y * scale, s.Z * scale)
-                    if box.Size ~= t then box.Size = t end
-                end
-            end
-        end
-    end
-    -- 清理消失的敌人
-    for m, set in pairs(safeBoxes) do
-        if not m.Parent then
-            for _, p in pairs(set) do
-                if p and p.Parent then pcall(function() p:Destroy() end) end
-            end
-            safeBoxes[m] = nil
-        end
-    end
-end
-
-task.spawn(function()
-    while true do
-        task.wait(0.12)
-        if State.HitboxEnabled then
-            if State.HitboxSafe then
-                pcall(applySafeHitbox)
-            else
-                pcall(applyHitbox)
-            end
-        else
-            if next(hbOriginal) ~= nil then pcall(restoreHitbox) end
-            if next(safeBoxes) ~= nil then pcall(clearSafeBoxes) end
-        end
-    end
-end)
-
 local RELOAD_MAP = {
     AssaultRifle = "ReloadRifle", K433 = "ReloadRifle", BT762 = "ReloadRifle",
     MX65 = "ReloadRifle", SK556 = "ReloadRifle", RN545 = "ReloadRifle", GX36 = "ReloadRifle",
@@ -991,20 +790,24 @@ local function tryReload()
 end
 VF.TryReload = tryReload
 
--- 一直装弹: 只在「最近没开火」时装弹, 避免打断射击
+-- 实例代次: 新脚本加载会递增, 旧的循环自动退出
+local MY_GEN = (getgenv().__VF_GEN or 0) + 1
+getgenv().__VF_GEN = MY_GEN
+
+-- 一直装弹
 task.spawn(function()
     local lastShotSeen = 0
     local lastCount = 0
     while true do
         task.wait(0.2)
-        if State.AlwaysReload then
+        -- ★ 代次不符说明有更新的实例加载了, 主动退出
+        if getgenv().__VF_GEN ~= MY_GEN then return end
+        if State.AlwaysReload and getgenv().VF == State then
             local cur = State.RedirectCount or 0
             if cur ~= lastCount then
-                -- 有人在开枪 → 不装弹
                 lastCount = cur
                 lastShotSeen = os.clock()
             elseif os.clock() - lastShotSeen > 0.6 then
-                -- 0.6 秒没开枪了 → 装一次
                 pcall(tryReload)
                 lastShotSeen = os.clock()
             end
@@ -1042,7 +845,7 @@ AimTab:Toggle({
 })
 AimTab:Slider({
     Title = "FOV 范围",
-    Value = { Min = 50, Max = 2400, Default = 800 },
+    Value = { Min = 50, Max = 2400, Default = 127 },
     Callback = function(v) State.SilentFOV = v end,
 })
 AimTab:Toggle({
@@ -1066,48 +869,6 @@ AimTab:Toggle({
     Title = "一直装弹 (无条件)",
     Value = false,
     Callback = function(s) State.AlwaysReload = s end,
-})
-
-AimTab:Section({ Title = "扩展碰撞箱", Icon = "box" })
-AimTab:Toggle({
-    Title = "启用扩展碰撞箱",
-    Value = false,
-    Callback = function(s)
-        State.HitboxEnabled = s
-        if not s then
-            if VF.RestoreHitbox then VF.RestoreHitbox() end
-            if VF.ClearSafeBoxes then VF.ClearSafeBoxes() end
-        end
-    end,
-})
-AimTab:Dropdown({
-    Title = "扩展部位",
-    Values = { "头部", "躯干", "根部件", "全身" },
-    Value = "头部",
-    Callback = function(v)
-        local map = { ["头部"] = "Head", ["躯干"] = "Torso",
-                      ["根部件"] = "Root", ["全身"] = "All" }
-        State.HitboxParts = map[v] or "Head"
-        if VF.RestoreHitbox then VF.RestoreHitbox() end
-    end,
-})
-AimTab:Dropdown({
-    Title = "实现方式",
-    Values = { "改原部件 (影响物理)", "附加辅助方块 (不动物理)" },
-    Value = "附加辅助方块 (不动物理)",
-    Callback = function(v)
-        State.HitboxSafe = (v == "附加辅助方块 (不动物理)")
-        if VF.RestoreHitbox then VF.RestoreHitbox() end
-        if VF.ClearSafeBoxes then VF.ClearSafeBoxes() end
-    end,
-})
-AimTab:Slider({
-    Title = "扩展倍数",
-    Value = { Min = 0.5, Max = 50, Default = 2, Decimals = 1 },
-    Callback = function(v)
-        State.HitboxScale = v
-        if VF.RestoreHitbox then VF.RestoreHitbox() end
-    end,
 })
 
 AimTab:Dropdown({
