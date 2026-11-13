@@ -309,12 +309,30 @@ local function guideOne(part)
                 drop = (ps and ps.BulletDrop) or 0.65
             end
         end)
-        info = { speed = speed, drop = drop, dist0 = dist }
+        -- 读 LifeTime (喷火器等短命弹需要)
+        local lifetime = 5
+        pcall(function()
+            local toolVal = part:FindFirstChild("Tool")
+            local tool = toolVal and toolVal.Value
+            local cfgObj = tool and tool:FindFirstChild("Config")
+            if cfgObj then
+                local cfg = require(cfgObj)
+                local ps = cfg and cfg.ProjectileSettings
+                lifetime = (ps and ps.LifeTime) or 5
+            end
+        end)
+        info = { speed = speed, drop = drop, dist0 = dist, lifetime = lifetime }
         tracked[part] = info
     end
 
     -- ★ 下坠补偿：飞行时间越长，提前抬得越高
     local flight = dist / math.max(info.speed, 1)
+    -- ★ 关键: 飞行时间不能超过子弹存活时间, 否则补偿会严重超量
+    local maxFlight = (info.lifetime or 5)
+    if flight > maxFlight then
+        -- 超出弹丸寿命 → 这个目标根本打不到, 不修正
+        return false
+    end
     local dropAmount = 0.5 * Workspace.Gravity * info.drop * flight * flight
     local aimPos = targetPos + Vector3.new(0, dropAmount, 0)
 
@@ -328,8 +346,32 @@ local function guideOne(part)
     local newDelta = aimPos - pos
     if newDelta.Magnitude < 1 then return false end
 
+    -- ★ 起点前移: 直接把弹丸瞬移到目标附近
+    --   ProjectileManager 每帧读 k.Position, 所以写 Position 立即生效
+    --   喷火器 Velocity=125 / LifeTime=0.35 射程仅 43 米, 靠这个才能远距离命中
+    if SilentAim.StartOffsetEnabled then
+        local off = SilentAim.StartOffset or 4
+        if dist > off + 1.5 then
+            local dir0 = newDelta.Unit
+            local teleportTo = aimPos - dir0 * off
+            pcall(function()
+                if part:IsA("BasePart") then
+                    part.Position = teleportTo
+                end
+            end)
+            newDelta = aimPos - teleportTo
+            if newDelta.Magnitude < 0.3 then
+                pcall(function() part:SetAttribute("direction", dir0) end)
+                SilentAim.RedirectCount = SilentAim.RedirectCount + 1
+                return true
+            end
+            dist = newDelta.Magnitude
+            pos = teleportTo
+        end
+    end
+
     -- ★ 只改方向，保持速度大小（ProjectileManager 用 direction.Unit 做速度方向）
-    part:SetAttribute("direction", newDelta.Unit)
+    pcall(function() part:SetAttribute("direction", newDelta.Unit) end)
     SilentAim.RedirectCount = SilentAim.RedirectCount + 1
     SilentAim.LastDist = dist
     return true
@@ -460,6 +502,222 @@ task.spawn(function()
         end
     end
 end)
+
+-- ============================================================
+-- ============================================================
+-- 热能破解 (Heat Break)
+--   游戏: 喷火器武器属性 Heat 每次开火 +0.714, 达到 100 后
+--         Equip.updateUsability 判定 v1 < 100 失败 → 火焰粒子关闭
+--   实现: 只要 Heat >= 90 就压回 0 (留余量, 避免 UI 闪烁)
+--   注意: 必须靠 SetAttribute 触发 AttributeChanged → updateUsability 重算
+-- ============================================================
+SilentAim.HeatBreakEnabled = false
+SilentAim.HeatBreakAuto = true      -- 备用: 自动补弹
+
+-- 起点前移 (把弹丸位移到目标附近, 绕过飞行距离限制)
+SilentAim.StartOffsetEnabled = false
+SilentAim.StartOffset = 5           -- 前移距离(米)
+
+local function getFlameTool()
+    local char = LP.Character
+    if not char then return nil end
+    local t = char:FindFirstChild("Flamethrower")
+    if t and t:IsA("Tool") then return t end
+    return nil
+end
+
+local function clearHeat()
+    local tool = getFlameTool()
+    if not tool then return false end
+    local h = tool:GetAttribute("Heat")
+    if h and h >= 90 then
+        pcall(function() tool:SetAttribute("Heat", 0) end)
+        return true
+    end
+    return false
+end
+SilentAim.ClearHeat = clearHeat
+
+local function refillAmmo()
+    local tool = getFlameTool()
+    if not tool then return false end
+    local vals = tool:FindFirstChild("Values")
+    local ammo = vals and vals:FindFirstChild("Ammo")
+    if ammo and ammo.Value <= 5 then
+        pcall(function() ammo.Value = 500 end)
+        return true
+    end
+    return false
+end
+SilentAim.RefillAmmo = refillAmmo
+
+task.spawn(function()
+    while true do
+        task.wait(0.08)
+        if SilentAim.HeatBreakEnabled then
+            pcall(clearHeat)
+        end
+        if SilentAim.HeatBreakAuto then
+            pcall(refillAmmo)
+        end
+    end
+end)
+
+-- ============================================================
+-- 全图着火 (All Map Burning) — 真实伤害版
+--   逆向: Shoot.Hit 命中后把 a1 塞进 u24 缓冲, 最后
+--         Network.fireServer("GunSystem", "DamageBatch", tool, u24)
+--   服务端只校验 DamageBatch 格式, 不独立校验真实命中
+--   所以直接构造 hitInfo 对全图僵尸结算伤害
+-- ============================================================
+SilentAim.AllBurnEnabled = false
+SilentAim.BurnDamage = 30          -- 每跳伤害
+SilentAim.BurnInterval = 0.5        -- 结算间隔(秒)
+SilentAim.BurnUseFlame = true       -- 用喷火器配置结算
+
+local function buildHitInfo(z)
+    local hum = z:FindFirstChildOfClass("Humanoid")
+    local part = z:FindFirstChild("Head") or z:FindFirstChild("HumanoidRootPart") or z.PrimaryPart
+    if not hum or not part then return nil end
+    local dir = Vector3.new(0, -1, 0)
+    return {
+        result = {
+            Instance = part,
+            Position = part.Position,
+            Normal = dir,
+            Material = part.Material,
+            Distance = 1,
+        },
+        target = z,
+        hitArmor = false,
+        armor = nil,
+        direction = dir,
+        projectile = nil,
+        penetrationCount = 0,
+    }
+end
+
+local function flushBurn()
+    local net = SilentAim.getNetwork and SilentAim.getNetwork()
+    if not net or type(net.fireServer) ~= "function" then return false end
+
+    -- 找一个喷火器作为「工具参数」
+    local char = LP.Character
+    local tool = char and char:FindFirstChild("Flamethrower")
+
+    local batch = {}
+    for _, z in ipairs(getZombies()) do
+        local hum = z:FindFirstChildOfClass("Humanoid")
+        if hum and hum.Health > 0 then
+            local hi = buildHitInfo(z)
+            if hi then table.insert(batch, hi) end
+        end
+    end
+    if #batch == 0 then return false end
+
+    pcall(function()
+        net.fireServer("GunSystem", "DamageBatch", tool, batch)
+    end)
+    SilentAim.BurnTicks = (SilentAim.BurnTicks or 0) + 1
+    SilentAim.BurnTargets = #batch
+    return true
+end
+SilentAim.FlushBurn = flushBurn
+
+-- 视觉层 (isBurning + 粒子)
+local burnCache = {}
+local function applyBurnVisual(z)
+    if not z or not z.Parent then return end
+    local rec = burnCache[z]
+    if not rec then
+        rec = { fires = {} }
+        for _, d in ipairs(z:GetDescendants()) do
+            if d:IsA("ParticleEmitter") and string.find(string.lower(d.Name), "fire") then
+                table.insert(rec.fires, { obj = d, orig = d.Enabled })
+            end
+        end
+        burnCache[z] = rec
+    end
+    for _, f in ipairs(rec.fires) do
+        if f.obj and f.obj.Parent then
+            pcall(function() f.obj.Enabled = true end)
+        end
+    end
+    pcall(function() z:SetAttribute("isBurning", true) end)
+end
+
+local function clearBurnVisual()
+    for z, rec in pairs(burnCache) do
+        for _, f in ipairs(rec.fires or {}) do
+            if f.obj and f.obj.Parent then
+                pcall(function() f.obj.Enabled = f.orig end)
+            end
+        end
+        if z and z.Parent then
+            pcall(function() z:SetAttribute("isBurning", false) end)
+        end
+    end
+    burnCache = {}
+end
+SilentAim.ClearBurn = clearBurnVisual
+
+-- 主循环
+task.spawn(function()
+    local lastTick = 0
+    while true do
+        task.wait(0.1)
+        if SilentAim.AllBurnEnabled then
+            local now = os.clock()
+            -- 视觉
+            local zombies = getZombies()
+            local alive = {}
+            for _, z in ipairs(zombies) do
+                local hum = z:FindFirstChildOfClass("Humanoid")
+                if hum and hum.Health > 0 then
+                    alive[z] = true
+                    pcall(applyBurnVisual, z)
+                end
+            end
+            for z in pairs(burnCache) do
+                if not alive[z] or not z.Parent then burnCache[z] = nil end
+            end
+            -- 伤害结算
+            if now - lastTick >= (SilentAim.BurnInterval or 0.5) then
+                lastTick = now
+                pcall(flushBurn)
+            end
+        elseif next(burnCache) ~= nil then
+            pcall(clearBurnVisual)
+        end
+    end
+end)
+
+
+
+-- ============================================================
+SilentAim.HeatBreakEnabled = false
+
+local function resetHeat()
+    local char = LP.Character
+    if not char then return end
+    local tool = char:FindFirstChildOfClass("Tool")
+    if not tool then return end
+    local h = tool:GetAttribute("Heat")
+    if h ~= nil and h > 0 then
+        pcall(function() tool:SetAttribute("Heat", 0) end)
+    end
+end
+SilentAim.ResetHeat = resetHeat
+
+task.spawn(function()
+    while true do
+        task.wait(0.05)
+        if SilentAim.HeatBreakEnabled then
+            pcall(resetHeat)
+        end
+    end
+end)
+
 
 -- ============================================================
 -- ESP — Highlight 版本 (参考 CombatSuite)
@@ -2214,6 +2472,16 @@ local combatContent = combatPanel.Body.Content
 local staminaToggle = CreateToggle("无限体力", combatContent, "infiniteStamina", function(on)
     local SA = getgenv().SilentAim
     if SA then SA.InfiniteStaminaEnabled = on end
+end, SUB)
+
+local heatToggle = CreateToggle("热能破解(备用)", combatContent, "heatBreak", function(on)
+    local SA = getgenv().SilentAim
+    if SA then SA.HeatBreakEnabled = on end
+end, SUB)
+
+local burnToggle = CreateToggle("全图着火", combatContent, "allBurn", function(on)
+    local SA = getgenv().SilentAim
+    if SA then SA.AllBurnEnabled = on end
 end, SUB)
 
 local statsToggle = CreateToggle("数据统计", combatContent, "statsOn", function(on)
